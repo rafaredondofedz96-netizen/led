@@ -1,0 +1,36 @@
+<resources>
+    <string name="app_name">SymphonySync</string>
+    <string name="nav_live">En Vivo</string>
+    <string name="nav_modes">Lamp LED</string>
+    <string name="nav_bluetooth">Bluetooth</string>
+    <string name="nav_account">Spotify</string>
+
+    <string name="power_on">Encendido</string>
+    <string name="power_off">Apagado</string>
+    <string name="sync_active">Sync Spotify Activo</string>
+    <string name="sync_paused">Sync Pausado</string>
+    <string name="no_track_playing">Reproduce música en Spotify</string>
+    <string name="no_track_subtitle">Los colores de la portada se enviarán en vivo a tu tira LED Symphony.</string>
+    <string name="ble_connected">Conectado</string>
+    <string name="ble_disconnected">Sin conexión LED</string>
+    <string name="ble_connecting">Conectando…</string>
+    <string name="ble_scanning">Buscando tiras LED…</string>
+
+    <string name="scan_devices">Buscar Tiras LED</string>
+    <string name="stop_scan">Detener</string>
+    <string name="disconnect">Desconectar</string>
+    <string name="connect">Conectar</string>
+
+    <string name="spotify_setup_title">Cuenta Spotify Guardada</string>
+    <string name="spotify_client_id">Client ID</string>
+    <string name="spotify_client_secret">Client Secret</string>
+    <string name="spotify_connect_btn">Conectar y Guardar Cuenta</string>
+    <string name="spotify_logout_btn">Borrar Cuenta Guardada</string>
+    <string name="spotify_redirect_label">Redirect URI para Spotify Developer:</string>
+    <string name="copy_uri">Copiar URI</string>
+    <string name="uri_copied">Redirect URI copiada</string>
+
+    <string name="notif_channel_name">Sincronización LED Symphony</string>
+    <string name="notif_channel_desc">Mantiene la sincronización de colores de Spotify con las luces LED del coche.</string>
+    <string name="notif_stop_action">Detener</string>
+</resources>

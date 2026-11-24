@@ -1,0 +1,6 @@
+{
+  "name": "SymphonySync",
+  "description": "Controlador BLE para tiras LED Symphony de coche sincronizado en vivo con los colores de portada de Spotify.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
