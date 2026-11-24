@@ -18,6 +18,8 @@ import com.example.spotify.CoverPalette
 import com.example.spotify.SpotifyRepository
 import com.example.spotify.SpotifyTrack
 import com.example.spotify.TrackPollResult
+import com.example.update.GitHubUpdateChecker
+import com.example.update.UpdateCheckState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -58,6 +60,9 @@ class SyncEngine(
 
     private val _playback = MutableStateFlow(LivePlaybackState())
     val playback: StateFlow<LivePlaybackState> = _playback.asStateFlow()
+
+    private val _updateState = MutableStateFlow<UpdateCheckState>(UpdateCheckState.Idle)
+    val updateState: StateFlow<UpdateCheckState> = _updateState.asStateFlow()
 
     private var pollJob: Job? = null
     private var animationJob: Job? = null
@@ -497,6 +502,17 @@ class SyncEngine(
             _playback.update {
                 LivePlaybackState(authFeedback = "Sesión cerrada")
             }
+        }
+    }
+
+    fun checkForUpdates(rawRepo: String) {
+        val normalized = GitHubUpdateChecker.normalizeRepoInput(rawRepo)
+        scope.launch {
+            if (normalized.isNotBlank()) {
+                prefsStore.saveGithubRepo(normalized)
+            }
+            _updateState.value = UpdateCheckState.Checking
+            _updateState.value = GitHubUpdateChecker.checkLatestRelease(rawRepo)
         }
     }
 }

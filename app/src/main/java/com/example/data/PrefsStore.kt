@@ -47,6 +47,7 @@ data class SavedAppPrefs(
     val activeEffectIndex: Int = 0,
     val pollIntervalMs: Long = 1200L,
     val autoConnectBle: Boolean = true,
+    val githubRepo: String = "",
 ) {
     val hasSpotifyCredentials: Boolean
         get() = clientId.isNotBlank() && clientSecret.isNotBlank()
@@ -78,6 +79,7 @@ class PrefsStore(context: Context) {
         val ACTIVE_EFFECT = intPreferencesKey("active_symphony_effect")
         val POLL_INTERVAL = longPreferencesKey("poll_interval_ms")
         val AUTO_CONNECT_BLE = booleanPreferencesKey("auto_connect_ble")
+        val GITHUB_REPO = stringPreferencesKey("github_repo")
     }
 
     val prefsFlow: Flow<SavedAppPrefs> = dataStore.data.map { p ->
@@ -100,6 +102,7 @@ class PrefsStore(context: Context) {
             activeEffectIndex = p[Keys.ACTIVE_EFFECT] ?: 0,
             pollIntervalMs = (p[Keys.POLL_INTERVAL] ?: 1200L).coerceIn(800L, 5000L),
             autoConnectBle = p[Keys.AUTO_CONNECT_BLE] ?: true,
+            githubRepo = p[Keys.GITHUB_REPO] ?: "",
         )
     }
 
@@ -195,5 +198,9 @@ class PrefsStore(context: Context) {
 
     suspend fun setAutoConnectBle(enabled: Boolean) {
         dataStore.edit { it[Keys.AUTO_CONNECT_BLE] = enabled }
+    }
+
+    suspend fun saveGithubRepo(repo: String) {
+        dataStore.edit { it[Keys.GITHUB_REPO] = repo.trim() }
     }
 }

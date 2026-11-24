@@ -2,8 +2,11 @@ package com.example
 
 import com.example.ble.LedProtocol
 import com.example.ble.ProtocolProfile
+import com.example.update.GitHubUpdateChecker
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ExampleUnitTest {
@@ -48,5 +51,16 @@ class ExampleUnitTest {
             ProtocolProfile.TRIONES,
             LedProtocol.detectProfile("QHM-1234", "0000ffd9-0000-1000-8000-00805f9b34fb"),
         )
+    }
+
+    @Test
+    fun `github update checker normalizes url and compares semver`() {
+        assertEquals(
+            "rafa/SymphonySync",
+            GitHubUpdateChecker.normalizeRepoInput("https://github.com/rafa/SymphonySync.git"),
+        )
+        assertTrue(GitHubUpdateChecker.isNewerVersion("1.3.0", "1.2.0"))
+        assertFalse(GitHubUpdateChecker.isNewerVersion("1.2.0", "1.2.0"))
+        assertFalse(GitHubUpdateChecker.isNewerVersion("1.1.9", "1.2.0"))
     }
 }

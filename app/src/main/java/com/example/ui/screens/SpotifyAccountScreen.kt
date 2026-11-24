@@ -33,6 +33,7 @@ import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.OpenInBrowser
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
@@ -70,6 +71,7 @@ import com.example.BuildConfig
 import com.example.R
 import com.example.spotify.SpotifyRepository
 import com.example.ui.MainUiState
+import com.example.update.UpdateCheckState
 import com.example.ui.theme.CockpitBorder
 import com.example.ui.theme.CockpitSurface
 import com.example.ui.theme.CockpitSurfaceElevated
@@ -87,6 +89,7 @@ fun SpotifyAccountScreen(
     onSubmitManualCode: (String, String, String) -> Unit,
     onSelectPollInterval: (Long) -> Unit,
     onLogout: (Boolean) -> Unit,
+    onCheckGithubUpdates: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
@@ -144,8 +147,9 @@ fun SpotifyAccountScreen(
                     .verticalScroll(rememberScrollState()),
             )
             GuideAndPerformanceColumn(
-                pollIntervalMs = state.prefs.pollIntervalMs,
+                state = state,
                 onSelectPollInterval = onSelectPollInterval,
+                onCheckGithubUpdates = onCheckGithubUpdates,
                 onCopyRedirectUri = {
                     clipboard.setText(AnnotatedString(SpotifyRepository.REDIRECT_URI))
                     Toast.makeText(context, R.string.uri_copied, Toast.LENGTH_SHORT).show()
@@ -180,8 +184,9 @@ fun SpotifyAccountScreen(
                 onLogout = onLogout,
             )
             GuideAndPerformanceColumn(
-                pollIntervalMs = state.prefs.pollIntervalMs,
+                state = state,
                 onSelectPollInterval = onSelectPollInterval,
+                onCheckGithubUpdates = onCheckGithubUpdates,
                 onCopyRedirectUri = {
                     clipboard.setText(AnnotatedString(SpotifyRepository.REDIRECT_URI))
                     Toast.makeText(context, R.string.uri_copied, Toast.LENGTH_SHORT).show()
@@ -404,8 +409,9 @@ private fun CredentialsCard(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GuideAndPerformanceColumn(
-    pollIntervalMs: Long,
+    state: MainUiState,
     onSelectPollInterval: (Long) -> Unit,
+    onCheckGithubUpdates: (String) -> Unit,
     onCopyRedirectUri: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -487,7 +493,7 @@ private fun GuideAndPerformanceColumn(
                 ) {
                     options.forEach { (ms, label) ->
                         FilterChip(
-                            selected = pollIntervalMs == ms,
+                            selected = state.prefs.pollIntervalMs == ms,
                             onClick = { onSelectPollInterval(ms) },
                             label = { Text(label) },
                             modifier = Modifier.testTag("poll_interval_$ms"),
@@ -502,7 +508,129 @@ private fun GuideAndPerformanceColumn(
             }
         }
 
+        GitHubUpdatesCard(
+            savedRepo = state.prefs.githubRepo,
+            updateState = state.updateState,
+            onCheckUpdates = onCheckGithubUpdates,
+        )
+
         Ts10BackgroundCard()
+    }
+}
+
+@Composable
+private fun GitHubUpdatesCard(
+    savedRepo: String,
+    updateState: UpdateCheckState,
+    onCheckUpdates: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    var repoInput by remember { mutableStateOf(savedRepo) }
+
+    LaunchedEffect(savedRepo) {
+        if (repoInput.isBlank() && savedRepo.isNotBlank()) {
+            repoInput = savedRepo
+        }
+    }
+
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = CockpitSurface,
+        border = BorderStroke(
+            1.dp,
+            if (updateState is UpdateCheckState.Available) SpotifyGreen else CockpitBorder,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Rounded.SystemUpdate,
+                    contentDescription = null,
+                    tint = if (updateState is UpdateCheckState.Available) SpotifyGreen else NeonCyan,
+                    modifier = Modifier.size(20.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Buscar Nueva Versión (GitHub)", style = MaterialTheme.typography.titleMedium)
+            }
+
+            OutlinedTextField(
+                value = repoInput,
+                onValueChange = { repoInput = it },
+                label = { Text("Repositorio (usuario/repo o URL)") },
+                placeholder = { Text("tuusuario/SymphonySync") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("github_repo_input"),
+            )
+
+            OutlinedButton(
+                onClick = { onCheckUpdates(repoInput) },
+                enabled = repoInput.isNotBlank() && updateState !is UpdateCheckState.Checking,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("check_github_update_btn"),
+            ) {
+                if (updateState is UpdateCheckState.Checking) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Comprobando GitHub…")
+                } else {
+                    Text("Buscar nueva versión")
+                }
+            }
+
+            when (updateState) {
+                is UpdateCheckState.Available -> {
+                    Text(
+                        text = "¡Nueva versión v${updateState.latestVersion} disponible!",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = SpotifyGreen,
+                    )
+                    Button(
+                        onClick = {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(updateState.apkDownloadUrl))
+                                )
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("download_apk_btn"),
+                    ) {
+                        Text("Descargar APK v${updateState.latestVersion}", color = Color.Black, fontWeight = FontWeight.Bold)
+                    }
+                }
+                is UpdateCheckState.UpToDate -> {
+                    Text(
+                        text = "Ya tienes la última versión (v${updateState.currentVersion}).",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = SpotifyGreen,
+                    )
+                }
+                is UpdateCheckState.Error -> {
+                    Text(
+                        text = updateState.message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = CoralError,
+                    )
+                }
+                else -> {
+                    Text(
+                        text = "Al subir tus cambios a GitHub, GitHub Actions compila el .apk automáticamente en Releases para bajarlo desde tu radio.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary,
+                    )
+                }
+            }
+        }
     }
 }
 

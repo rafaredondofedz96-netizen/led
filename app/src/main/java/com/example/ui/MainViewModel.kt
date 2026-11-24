@@ -10,6 +10,7 @@ import com.example.ble.ProtocolProfile
 import com.example.core.LivePlaybackState
 import com.example.data.CoverSyncStyle
 import com.example.data.SavedAppPrefs
+import com.example.update.UpdateCheckState
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -26,6 +27,7 @@ data class MainUiState(
     val prefs: SavedAppPrefs = SavedAppPrefs(),
     val ble: BleUiState = BleUiState(),
     val playback: LivePlaybackState = LivePlaybackState(),
+    val updateState: UpdateCheckState = UpdateCheckState.Idle,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -36,8 +38,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         engine.prefs,
         engine.bleState,
         engine.playback,
-    ) { prefs, ble, playback ->
-        MainUiState(prefs = prefs, ble = ble, playback = playback)
+        engine.updateState,
+    ) { prefs, ble, playback, updateState ->
+        MainUiState(
+            prefs = prefs,
+            ble = ble,
+            playback = playback,
+            updateState = updateState,
+        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000L),
@@ -74,4 +82,5 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearAuthMessages() = engine.clearAuthMessages()
     fun logoutSpotify(eraseCredentialsToo: Boolean) = engine.logoutSpotify(eraseCredentialsToo)
+    fun checkForGithubUpdates(repoInput: String) = engine.checkForUpdates(repoInput)
 }

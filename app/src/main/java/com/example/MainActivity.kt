@@ -322,6 +322,7 @@ private fun ActiveTabContent(
             onSubmitManualCode = viewModel::submitManualCallback,
             onSelectPollInterval = viewModel::setPollIntervalMs,
             onLogout = viewModel::logoutSpotify,
+            onCheckGithubUpdates = viewModel::checkForGithubUpdates,
         )
     }
 }
