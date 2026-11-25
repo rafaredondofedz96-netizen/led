@@ -51,7 +51,6 @@ import android.graphics.Color as AndroidColor
 fun SymphonyLedStripBar(
     primaryColor: Color,
     secondaryColor: Color,
-    ambientColor: Color,
     isPowerOn: Boolean,
     brightness: Int,
     modifier: Modifier = Modifier,
@@ -65,11 +64,6 @@ fun SymphonyLedStripBar(
         targetValue = if (isPowerOn) secondaryColor else Color(0xFF1A1F2B),
         animationSpec = tween(220),
         label = "strip_secondary",
-    )
-    val animAmbient by animateColorAsState(
-        targetValue = if (isPowerOn) ambientColor else Color(0xFF151924),
-        animationSpec = tween(220),
-        label = "strip_ambient",
     )
     val alphaFactor = if (isPowerOn) (0.35f + (brightness / 100f) * 0.65f) else 0.4f
 
@@ -86,7 +80,6 @@ fun SymphonyLedStripBar(
             colors = listOf(
                 animPrimary.copy(alpha = alphaFactor),
                 animSecondary.copy(alpha = alphaFactor),
-                animAmbient.copy(alpha = alphaFactor),
                 animPrimary.copy(alpha = alphaFactor),
             )
         )
@@ -98,10 +91,10 @@ fun SymphonyLedStripBar(
         for (i in 0 until segments) {
             val left = i * (segWidth + gap)
             val frac = i / (segments - 1).toFloat()
-            val segColor = when {
-                frac < 0.33f -> lerpColor(animPrimary, animSecondary, frac / 0.33f)
-                frac < 0.66f -> lerpColor(animSecondary, animAmbient, (frac - 0.33f) / 0.33f)
-                else -> lerpColor(animAmbient, animPrimary, (frac - 0.66f) / 0.34f)
+            val segColor = if (frac < 0.5f) {
+                lerpColor(animPrimary, animSecondary, frac / 0.5f)
+            } else {
+                lerpColor(animSecondary, animPrimary, (frac - 0.5f) / 0.5f)
             }
             drawRoundRect(
                 color = segColor.copy(alpha = alphaFactor),

@@ -166,7 +166,6 @@ private fun HeroSpotifyStage(
     val palette = state.playback.palette
     val primaryColor = Color(palette.primaryArgb)
     val secondaryColor = Color(palette.secondaryArgb)
-    val ambientColor = Color(palette.ambientArgb)
 
     Surface(
         modifier = modifier
@@ -241,7 +240,6 @@ private fun HeroSpotifyStage(
             SymphonyLedStripBar(
                 primaryColor = if (state.prefs.syncEnabled) liveColor else Color(state.prefs.manualColorArgb),
                 secondaryColor = if (state.prefs.syncEnabled) secondaryColor else Color(state.prefs.manualColorArgb),
-                ambientColor = if (state.prefs.syncEnabled) ambientColor else Color(state.prefs.manualColorArgb),
                 isPowerOn = state.prefs.powerOn,
                 brightness = state.prefs.brightness,
             )
@@ -312,14 +310,13 @@ private fun HeroSpotifyStage(
                 }
             }
 
-            // Extracted 3-Color Palette Strip
+            // Extracted 2 Predominant Colors Strip
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                PaletteChip("Principal", primaryColor, Modifier.weight(1f))
-                PaletteChip("Acento", secondaryColor, Modifier.weight(1f))
-                PaletteChip("Ambiente", ambientColor, Modifier.weight(1f))
+                PaletteChip("Color Principal", primaryColor, Modifier.weight(1f))
+                PaletteChip("Secundario", secondaryColor, Modifier.weight(1f))
             }
 
             // Helpful Action Shortcuts when not yet configured

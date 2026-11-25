@@ -9,13 +9,11 @@ import kotlin.math.abs
 data class CoverPalette(
     val primaryArgb: Int,
     val secondaryArgb: Int,
-    val ambientArgb: Int,
 ) {
     companion object {
         val Default = CoverPalette(
             primaryArgb = 0xFF00E5FF.toInt(),
             secondaryArgb = 0xFFFF3D8B.toInt(),
-            ambientArgb = 0xFF8C52FF.toInt(),
         )
     }
 }
@@ -23,8 +21,8 @@ data class CoverPalette(
 object AlbumPaletteExtractor {
 
     /**
-     * Decodes a low-res RGB_565 bitmap directly from stream and extracts 3 vivid
-     * Symphony LED colors in < 2ms with minimal RAM usage.
+     * Decodes a 64x64 RGB_565 thumbnail and extracts ONLY the 2 most predominant
+     * vibrant colors from the album cover, avoiding pink/orange distortion on red covers.
      */
     fun extractFromBytes(bytes: ByteArray): CoverPalette {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -60,12 +58,13 @@ object AlbumPaletteExtractor {
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 36 hue buckets (10 degrees each) + neutral fallback accumulator
-        val bucketCount = 36
+        // 24 hue bins (15 degrees each) weighted strongly by pixel area so true dominant color wins
+        val bucketCount = 24
         val bucketWeight = FloatArray(bucketCount)
         val bucketR = FloatArray(bucketCount)
         val bucketG = FloatArray(bucketCount)
         val bucketB = FloatArray(bucketCount)
+        val bucketCountPx = IntArray(bucketCount)
 
         var fallbackWeight = 0f
         var fallbackR = 0f
@@ -82,10 +81,12 @@ object AlbumPaletteExtractor {
             val sat = hsv[1]
             val valBright = hsv[2]
 
-            // Skip near-black and near-white pixels for vibrant car LEDs
+            // Skip near-black shadows
             if (valBright < 0.14f) continue
-            if (sat < 0.16f || valBright > 0.96f && sat < 0.22f) {
-                val fw = valBright * 0.25f
+
+            // Keep neutral grays/whites only as fallback if entire cover is monochrome
+            if (sat < 0.24f || (valBright > 0.94f && sat < 0.30f)) {
+                val fw = valBright * 0.3f
                 fallbackWeight += fw
                 fallbackR += r * fw
                 fallbackG += g * fw
@@ -93,64 +94,57 @@ object AlbumPaletteExtractor {
                 continue
             }
 
-            // Favor vivid, mid-to-high brightness colors
-            val weight = (sat * sat * 2.4f) * (0.4f + valBright * 0.8f)
-            val idx = ((hue / 10f).toInt()).coerceIn(0, bucketCount - 1)
+            // Area-dominant weighting: pixel count matters most, moderate boost for rich saturation
+            val weight = 1.0f + (sat * 1.4f) + (valBright * 0.4f)
+            val idx = ((hue / 15f).toInt()).coerceIn(0, bucketCount - 1)
             bucketWeight[idx] += weight
             bucketR[idx] += r * weight
             bucketG[idx] += g * weight
             bucketB[idx] += b * weight
+            bucketCountPx[idx]++
         }
 
         val rankedBuckets = (0 until bucketCount)
-            .filter { bucketWeight[it] > 0f }
+            .filter { bucketWeight[it] > 0f && bucketCountPx[it] >= 4 }
             .sortedByDescending { bucketWeight[it] }
 
         if (rankedBuckets.isEmpty()) {
             if (fallbackWeight > 0f) {
-                val avg = boostForLed(
+                val avg = normalizeColorForLed(
                     Color.rgb(
                         (fallbackR / fallbackWeight).toInt().coerceIn(0, 255),
                         (fallbackG / fallbackWeight).toInt().coerceIn(0, 255),
                         (fallbackB / fallbackWeight).toInt().coerceIn(0, 255),
                     )
                 )
-                return CoverPalette(avg, shiftHue(avg, 45f), shiftHue(avg, -45f))
+                return CoverPalette(avg, shiftHue(avg, 120f))
             }
             return CoverPalette.Default
         }
 
         val primaryIdx = rankedBuckets.first()
-        val primary = bucketToLedColor(primaryIdx, bucketWeight, bucketR, bucketG, bucketB)
+        val primary = bucketToPureLedColor(primaryIdx, bucketWeight, bucketR, bucketG, bucketB)
 
-        // Pick secondary with at least 40 deg hue separation for dynamic contrast
+        // Only pick a 2nd color if it has meaningful visual presence (>= 18% of primary) and distinct hue
+        val primaryWeight = bucketWeight[primaryIdx]
         val secondaryIdx = rankedBuckets.firstOrNull { idx ->
-            hueDistanceDegrees(idx * 10f, primaryIdx * 10f) >= 40f
-        } ?: rankedBuckets.getOrNull(1)
+            idx != primaryIdx &&
+                bucketWeight[idx] >= primaryWeight * 0.18f &&
+                hueDistanceDegrees(idx * 15f, primaryIdx * 15f) >= 45f
+        }
         val secondary = if (secondaryIdx != null) {
-            bucketToLedColor(secondaryIdx, bucketWeight, bucketR, bucketG, bucketB)
+            bucketToPureLedColor(secondaryIdx, bucketWeight, bucketR, bucketG, bucketB)
         } else {
-            shiftHue(primary, 60f)
-        }
-
-        val ambientIdx = rankedBuckets.firstOrNull { idx ->
-            idx != primaryIdx && idx != secondaryIdx &&
-                hueDistanceDegrees(idx * 10f, primaryIdx * 10f) >= 25f
-        }
-        val ambient = if (ambientIdx != null) {
-            bucketToLedColor(ambientIdx, bucketWeight, bucketR, bucketG, bucketB)
-        } else {
-            shiftHue(primary, -50f)
+            primary
         }
 
         return CoverPalette(
             primaryArgb = primary,
             secondaryArgb = secondary,
-            ambientArgb = ambient,
         )
     }
 
-    private fun bucketToLedColor(
+    private fun bucketToPureLedColor(
         idx: Int,
         w: FloatArray,
         rArr: FloatArray,
@@ -161,19 +155,21 @@ object AlbumPaletteExtractor {
         val r = (rArr[idx] / weight).toInt().coerceIn(0, 255)
         val g = (gArr[idx] / weight).toInt().coerceIn(0, 255)
         val b = (bArr[idx] / weight).toInt().coerceIn(0, 255)
-        return boostForLed(Color.rgb(r, g, b))
+        return normalizeColorForLed(Color.rgb(r, g, b))
     }
 
     /**
-     * Ensures LED colors look rich and saturated on RGB car strips instead of muddy pastel.
+     * Preserves true hue (doesn't turn deep red into pink/orange) while ensuring
+     * full LED saturation and crisp brightness.
      */
-    private fun boostForLed(argb: Int): Int {
+    private fun normalizeColorForLed(argb: Int): Int {
         val hsv = FloatArray(3)
         Color.colorToHSV(argb, hsv)
-        if (hsv[1] > 0.12f) {
-            hsv[1] = (hsv[1] * 1.22f).coerceIn(0.68f, 1.0f)
+        if (hsv[1] >= 0.25f) {
+            // Pull high saturation cleanly without shifting hue toward yellow/pink
+            hsv[1] = hsv[1].coerceAtLeast(0.85f)
         }
-        hsv[2] = hsv[2].coerceIn(0.75f, 1.0f)
+        hsv[2] = hsv[2].coerceAtLeast(0.88f)
         return Color.HSVToColor(hsv)
     }
 
@@ -181,8 +177,8 @@ object AlbumPaletteExtractor {
         val hsv = FloatArray(3)
         Color.colorToHSV(argb, hsv)
         hsv[0] = ((hsv[0] + deltaDeg) % 360f + 360f) % 360f
-        hsv[1] = hsv[1].coerceIn(0.65f, 1.0f)
-        hsv[2] = hsv[2].coerceIn(0.70f, 1.0f)
+        hsv[1] = hsv[1].coerceIn(0.80f, 1.0f)
+        hsv[2] = hsv[2].coerceIn(0.85f, 1.0f)
         return Color.HSVToColor(hsv)
     }
 

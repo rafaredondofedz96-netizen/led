@@ -4,6 +4,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -19,14 +21,18 @@ import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.BluetoothConnected
 import androidx.compose.material.icons.rounded.BluetoothSearching
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.LinkOff
+import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.RadioButtonChecked
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.SignalCellularAlt
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -42,6 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.ble.BleConnectionStatus
+import com.example.ble.ColorOrder
 import com.example.ble.ProtocolProfile
 import com.example.ble.ScannedBleDevice
 import com.example.ui.MainUiState
@@ -62,8 +69,11 @@ fun BluetoothScreen(
     onRequestScan: () -> Unit,
     onStopScan: () -> Unit,
     onConnectDevice: (String, String) -> Unit,
-    onDisconnect: () -> Unit,
+    onDisconnectDevice: (String) -> Unit,
+    onDisconnectAll: () -> Unit,
     onSelectProtocol: (ProtocolProfile) -> Unit,
+    onSelectColorOrder: (ColorOrder) -> Unit,
+    onTogglePureCalibration: (Boolean) -> Unit,
     onToggleAutoConnect: (Boolean) -> Unit,
 ) {
     val ble = state.ble
@@ -84,8 +94,15 @@ fun BluetoothScreen(
                     state = state,
                     onRequestScan = onRequestScan,
                     onStopScan = onStopScan,
-                    onDisconnect = onDisconnect,
+                    onDisconnectDevice = onDisconnectDevice,
+                    onDisconnectAll = onDisconnectAll,
                     onToggleAutoConnect = onToggleAutoConnect,
+                )
+                ColorCalibrationCard(
+                    colorOrder = state.prefs.colorOrder,
+                    pureCalibration = state.prefs.pureLedCalibration,
+                    onSelectColorOrder = onSelectColorOrder,
+                    onTogglePureCalibration = onTogglePureCalibration,
                 )
                 ProtocolSelectorCard(
                     selected = ble.selectedProfile,
@@ -96,9 +113,9 @@ fun BluetoothScreen(
             DiscoveredDevicesCard(
                 devices = ble.discoveredDevices,
                 isScanning = ble.isScanning,
-                connectedAddress = ble.connectedAddress,
-                isConnected = ble.isConnected,
+                devicesByAddress = ble.devicesByAddress.mapValues { it.value.status },
                 onConnect = onConnectDevice,
+                onDisconnectDevice = onDisconnectDevice,
                 modifier = Modifier
                     .weight(1f)
                     .verticalScroll(rememberScrollState()),
@@ -116,15 +133,22 @@ fun BluetoothScreen(
                 state = state,
                 onRequestScan = onRequestScan,
                 onStopScan = onStopScan,
-                onDisconnect = onDisconnect,
+                onDisconnectDevice = onDisconnectDevice,
+                onDisconnectAll = onDisconnectAll,
                 onToggleAutoConnect = onToggleAutoConnect,
             )
             DiscoveredDevicesCard(
                 devices = ble.discoveredDevices,
                 isScanning = ble.isScanning,
-                connectedAddress = ble.connectedAddress,
-                isConnected = ble.isConnected,
+                devicesByAddress = ble.devicesByAddress.mapValues { it.value.status },
                 onConnect = onConnectDevice,
+                onDisconnectDevice = onDisconnectDevice,
+            )
+            ColorCalibrationCard(
+                colorOrder = state.prefs.colorOrder,
+                pureCalibration = state.prefs.pureLedCalibration,
+                onSelectColorOrder = onSelectColorOrder,
+                onTogglePureCalibration = onTogglePureCalibration,
             )
             ProtocolSelectorCard(
                 selected = ble.selectedProfile,
@@ -141,10 +165,13 @@ private fun ConnectionStatusCard(
     state: MainUiState,
     onRequestScan: () -> Unit,
     onStopScan: () -> Unit,
-    onDisconnect: () -> Unit,
+    onDisconnectDevice: (String) -> Unit,
+    onDisconnectAll: () -> Unit,
     onToggleAutoConnect: (Boolean) -> Unit,
 ) {
     val ble = state.ble
+    val activeNodes = ble.devicesByAddress.values.toList()
+
     Surface(
         shape = MaterialTheme.shapes.large,
         color = CockpitSurface,
@@ -176,23 +203,71 @@ private fun ConnectionStatusCard(
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = ble.connectedName ?: state.prefs.lastBleName.ifBlank { "Controlador Symphony BLE" },
+                            text = when {
+                                ble.connectedCount > 1 -> "${ble.connectedCount} Controladores LED Conectados"
+                                ble.connectedCount == 1 -> "${ble.connectedName ?: "LEDCAR"} conectado"
+                                else -> "Controladores Symphony BLE"
+                            },
                             style = MaterialTheme.typography.titleLarge,
                         )
                         Text(
-                            text = when (ble.status) {
-                                BleConnectionStatus.CONNECTED ->
-                                    "Conectado • UUID ${ble.activeCharUuid?.take(8) ?: "---"}"
-                                BleConnectionStatus.CONNECTING -> "Conectando GATT…"
-                                BleConnectionStatus.DISCOVERING -> "Buscando característica LED…"
-                                BleConnectionStatus.DISCONNECTED ->
-                                    if (state.prefs.lastBleAddress.isNotBlank()) {
-                                        "Guardado: ${state.prefs.lastBleAddress}"
-                                    } else "Sin dispositivo emparejado"
+                            text = if (state.prefs.savedBleDevices.isNotEmpty()) {
+                                "Guardados: ${state.prefs.savedBleDevices.joinToString(" + ") { it.name }}"
+                            } else {
+                                "Toca ambos LEDCAR-01 para conectarlos a la vez"
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             color = TextSecondary,
                         )
+                    }
+                }
+            }
+
+            if (activeNodes.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    activeNodes.forEach { node ->
+                        val connected = node.status == BleConnectionStatus.CONNECTED
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = CockpitSurfaceElevated,
+                            border = BorderStroke(
+                                1.dp,
+                                if (connected) SpotifyGreen.copy(alpha = 0.55f) else AmberWarn.copy(alpha = 0.55f),
+                            ),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "${node.name} (${node.detectedProfile.id})",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (connected) SpotifyGreen else AmberWarn,
+                                    )
+                                    Text(
+                                        text = "${node.address} • ${
+                                            if (connected) "Conectado" else "Conectando…"
+                                        }",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextMuted,
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { onDisconnectDevice(node.address) },
+                                    modifier = Modifier.testTag("disconnect_${node.address}"),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Close,
+                                        contentDescription = "Quitar ${node.name}",
+                                        tint = CoralError,
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -237,7 +312,7 @@ private fun ConnectionStatusCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Auto-conectar al abrir la radio",
+                    text = "Auto-conectar todos al abrir",
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 Switch(
@@ -274,9 +349,9 @@ private fun ConnectionStatusCard(
                     }
                 }
 
-                if (ble.isConnected || ble.status == BleConnectionStatus.CONNECTING) {
+                if (activeNodes.isNotEmpty()) {
                     OutlinedButton(
-                        onClick = onDisconnect,
+                        onClick = onDisconnectAll,
                         border = BorderStroke(1.dp, CoralError),
                         modifier = Modifier
                             .height(50.dp)
@@ -301,9 +376,9 @@ private fun ConnectionStatusCard(
 private fun DiscoveredDevicesCard(
     devices: List<ScannedBleDevice>,
     isScanning: Boolean,
-    connectedAddress: String?,
-    isConnected: Boolean,
+    devicesByAddress: Map<String, BleConnectionStatus>,
     onConnect: (String, String) -> Unit,
+    onDisconnectDevice: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -320,10 +395,15 @@ private fun DiscoveredDevicesCard(
                 text = "Dispositivos BLE Cercanos (${devices.size})",
                 style = MaterialTheme.typography.titleLarge,
             )
+            Text(
+                text = "Toca varios dispositivos (ej. ambos LEDCAR-01) para controlar puertas y reposapiés a la vez.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+            )
             if (devices.isEmpty()) {
                 Text(
                     text = if (isScanning) {
-                        "Buscando módulos LED (CAR, ELK-BLEDOM, BJ_LED, Symphony)…"
+                        "Buscando módulos LED (LEDCAR-01, ELK, BJ_LED)…"
                     } else {
                         "Pulsa \"Buscar Tiras LED\" con las luces del coche encendidas."
                     },
@@ -332,18 +412,33 @@ private fun DiscoveredDevicesCard(
                 )
             } else {
                 devices.forEach { device ->
-                    val isThisConnected = isConnected && connectedAddress == device.address
+                    val status = devicesByAddress[device.address]
+                    val isThisConnected = status == BleConnectionStatus.CONNECTED
+                    val isConnecting = status == BleConnectionStatus.CONNECTING ||
+                        status == BleConnectionStatus.DISCOVERING
+
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("ble_device_${device.address}")
-                            .clickable { onConnect(device.address, device.name) },
+                            .clickable {
+                                if (isThisConnected || isConnecting) {
+                                    onDisconnectDevice(device.address)
+                                } else {
+                                    onConnect(device.address, device.name)
+                                }
+                            },
                         shape = MaterialTheme.shapes.medium,
-                        color = if (isThisConnected) SpotifyGreen.copy(alpha = 0.14f) else CockpitSurfaceElevated,
+                        color = when {
+                            isThisConnected -> SpotifyGreen.copy(alpha = 0.14f)
+                            isConnecting -> AmberWarn.copy(alpha = 0.12f)
+                            else -> CockpitSurfaceElevated
+                        },
                         border = BorderStroke(
                             1.dp,
                             when {
                                 isThisConnected -> SpotifyGreen
+                                isConnecting -> AmberWarn
                                 device.isLikelyLedController -> NeonCyan.copy(alpha = 0.55f)
                                 else -> CockpitBorder
                             },
@@ -404,10 +499,82 @@ private fun DiscoveredDevicesCard(
                                         contentDescription = "Conectado",
                                         tint = SpotifyGreen,
                                     )
+                                } else if (isConnecting) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                        color = AmberWarn,
+                                    )
                                 }
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ColorCalibrationCard(
+    colorOrder: ColorOrder,
+    pureCalibration: Boolean,
+    onSelectColorOrder: (ColorOrder) -> Unit,
+    onTogglePureCalibration: (Boolean) -> Unit,
+) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = CockpitSurface,
+        border = BorderStroke(1.dp, CockpitBorder),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Rounded.Palette, contentDescription = null, tint = NeonCyan, modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Calibración de Color Tiras LED", style = MaterialTheme.typography.titleLarge)
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Corrección Rojo/Verde Puro", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        text = "Evita que el rojo salga rosa o naranja en las tiras",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary,
+                    )
+                }
+                Switch(
+                    checked = pureCalibration,
+                    onCheckedChange = onTogglePureCalibration,
+                    modifier = Modifier.testTag("pure_led_cal_switch"),
+                )
+            }
+
+            Text(
+                text = "Orden de canales de tus tiras (si ves rojo como verde, cambia a GRB):",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ColorOrder.entries.forEach { order ->
+                    FilterChip(
+                        selected = colorOrder == order,
+                        onClick = { onSelectColorOrder(order) },
+                        label = { Text(order.label) },
+                        modifier = Modifier.testTag("color_order_${order.id}"),
+                    )
                 }
             }
         }

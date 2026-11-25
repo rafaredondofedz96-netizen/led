@@ -27,7 +27,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 enum class BleConnectionStatus {
     DISCONNECTED,
@@ -43,22 +45,51 @@ data class ScannedBleDevice(
     val isLikelyLedController: Boolean,
 )
 
+data class ConnectedDeviceInfo(
+    val address: String,
+    val name: String,
+    val status: BleConnectionStatus,
+    val activeCharUuid: String? = null,
+    val detectedProfile: ProtocolProfile = ProtocolProfile.LEDCAR_01,
+)
+
 data class BleUiState(
     val isBluetoothSupported: Boolean = true,
     val isBluetoothEnabled: Boolean = true,
     val isScanning: Boolean = false,
-    val status: BleConnectionStatus = BleConnectionStatus.DISCONNECTED,
-    val connectedAddress: String? = null,
-    val connectedName: String? = null,
-    val activeCharUuid: String? = null,
-    val detectedProfile: ProtocolProfile = ProtocolProfile.ELK_LED_LAMP,
+    val devicesByAddress: Map<String, ConnectedDeviceInfo> = emptyMap(),
     val selectedProfile: ProtocolProfile = ProtocolProfile.AUTO,
     val discoveredDevices: List<ScannedBleDevice> = emptyList(),
     val lastTxHex: String = "--",
     val lastWriteLatencyMs: Long = 0L,
     val statusMessage: String? = null,
 ) {
-    val isConnected: Boolean get() = status == BleConnectionStatus.CONNECTED
+    val connectedDevices: List<ConnectedDeviceInfo>
+        get() = devicesByAddress.values.filter { it.status == BleConnectionStatus.CONNECTED }
+
+    val connectedCount: Int get() = connectedDevices.size
+    val isConnected: Boolean get() = connectedCount > 0
+
+    val status: BleConnectionStatus
+        get() = when {
+            connectedCount > 0 -> BleConnectionStatus.CONNECTED
+            devicesByAddress.values.any { it.status == BleConnectionStatus.DISCOVERING } ->
+                BleConnectionStatus.DISCOVERING
+            devicesByAddress.values.any { it.status == BleConnectionStatus.CONNECTING } ->
+                BleConnectionStatus.CONNECTING
+            else -> BleConnectionStatus.DISCONNECTED
+        }
+
+    val connectedAddress: String? get() = connectedDevices.firstOrNull()?.address
+    val connectedName: String?
+        get() = when (connectedCount) {
+            0 -> null
+            1 -> connectedDevices.first().name
+            else -> "$connectedCount tiras LED"
+        }
+    val activeCharUuid: String? get() = connectedDevices.firstOrNull()?.activeCharUuid
+    val detectedProfile: ProtocolProfile
+        get() = connectedDevices.firstOrNull()?.detectedProfile ?: ProtocolProfile.LEDCAR_01
 }
 
 class SymphonyBleManager(private val context: Context) {
@@ -76,21 +107,29 @@ class SymphonyBleManager(private val context: Context) {
     )
     val state: StateFlow<BleUiState> = _state.asStateFlow()
 
-    private var gatt: BluetoothGatt? = null
-    private var writeChar: BluetoothGattCharacteristic? = null
+    private class BleNode(
+        val address: String,
+        val name: String,
+        var gatt: BluetoothGatt? = null,
+        var writeChar: BluetoothGattCharacteristic? = null,
+        var status: BleConnectionStatus = BleConnectionStatus.CONNECTING,
+        var detectedProfile: ProtocolProfile = ProtocolProfile.LEDCAR_01,
+        var activeCharUuid: String? = null,
+        var lastColorPacket: ByteArray? = null,
+        val controlChannel: Channel<ByteArray> = Channel(capacity = 12),
+        val colorChannel: Channel<ByteArray> = Channel(capacity = Channel.CONFLATED),
+        var writerJob: Job? = null,
+    )
+
+    private val nodes = ConcurrentHashMap<String, BleNode>()
+    private val manuallyDisconnectedAddresses = ConcurrentHashMap.newKeySet<String>()
+
     private var scanJob: Job? = null
-    private var lastColorBytesSent: ByteArray? = null
-    @Volatile
-    var userDisconnected: Boolean = false
-        private set
 
-    // Two channels: reliable control commands + conflated live color stream for zero-backlog low latency
-    private val controlChannel = Channel<ByteArray>(capacity = 8)
-    private val colorChannel = Channel<ByteArray>(capacity = Channel.CONFLATED)
-
+    // Prioritize 0xFFE1 first for LEDCAR-01 / VGETTING / LED LAMP controllers
     private val preferredCharPrefixes = listOf(
-        "0000fff3",
         "0000ffe1",
+        "0000fff3",
         "0000fff1",
         "0000ee01",
         "0000ae01",
@@ -99,15 +138,11 @@ class SymphonyBleManager(private val context: Context) {
     )
 
     private val ledKeywords = listOf(
-        "CAR", "LED", "ELK", "BLEDOM", "MELK", "BJ_", "SYMPHONY",
-        "LAMP", "TRIONES", "SP110", "QHM", "LOTUS", "RGB", "LIGHT",
+        "LEDCAR", "LEDDMX", "CAR", "LED", "ELK", "BLEDOM", "MELK", "BJ_",
+        "SYMPHONY", "LAMP", "TRIONES", "SP110", "QHM", "LOTUS", "RGB", "LIGHT",
     )
 
-    private val deviceMap = linkedMapOf<String, ScannedBleDevice>()
-
-    init {
-        startWriterLoop()
-    }
+    private val discoveredMap = linkedMapOf<String, ScannedBleDevice>()
 
     fun hasBleScanPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -132,6 +167,9 @@ class SymphonyBleManager(private val context: Context) {
         }
     }
 
+    fun isManuallyDisconnected(address: String): Boolean =
+        manuallyDisconnectedAddresses.contains(address)
+
     fun refreshAdapterState() {
         val bt = adapter
         _state.update {
@@ -146,13 +184,14 @@ class SymphonyBleManager(private val context: Context) {
         _state.update { it.copy(selectedProfile = profile) }
     }
 
+    private fun effectiveProfileFor(node: BleNode): ProtocolProfile {
+        val selected = _state.value.selectedProfile
+        return if (selected == ProtocolProfile.AUTO) node.detectedProfile else selected
+    }
+
     fun effectiveProfile(): ProtocolProfile {
-        val current = _state.value
-        return if (current.selectedProfile == ProtocolProfile.AUTO) {
-            current.detectedProfile
-        } else {
-            current.selectedProfile
-        }
+        val selected = _state.value.selectedProfile
+        return if (selected == ProtocolProfile.AUTO) _state.value.detectedProfile else selected
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -168,9 +207,9 @@ class SymphonyBleManager(private val context: Context) {
                 rssi = result.rssi,
                 isLikelyLedController = isLikelyLed,
             )
-            synchronized(deviceMap) {
-                deviceMap[device.address] = entry
-                val sorted = deviceMap.values.sortedWith(
+            synchronized(discoveredMap) {
+                discoveredMap[device.address] = entry
+                val sorted = discoveredMap.values.sortedWith(
                     compareByDescending<ScannedBleDevice> { it.isLikelyLedController }
                         .thenByDescending { it.rssi }
                 )
@@ -206,7 +245,7 @@ class SymphonyBleManager(private val context: Context) {
         }
 
         stopScan()
-        synchronized(deviceMap) { deviceMap.clear() }
+        synchronized(discoveredMap) { discoveredMap.clear() }
         _state.update {
             it.copy(
                 isScanning = true,
@@ -256,9 +295,18 @@ class SymphonyBleManager(private val context: Context) {
             _state.update { it.copy(statusMessage = "Permiso BLUETOOTH_CONNECT requerido") }
             return
         }
-        userDisconnected = false
-        stopScan()
-        closeGattInternal()
+
+        val existing = nodes[address]
+        if (existing != null &&
+            (existing.status == BleConnectionStatus.CONNECTED ||
+                existing.status == BleConnectionStatus.CONNECTING ||
+                existing.status == BleConnectionStatus.DISCOVERING)
+        ) {
+            return
+        }
+
+        manuallyDisconnectedAddresses.remove(address)
+        closeNodeInternal(address)
 
         val device: BluetoothDevice = try {
             bt.getRemoteDevice(address)
@@ -267,83 +315,104 @@ class SymphonyBleManager(private val context: Context) {
             return
         }
 
-        val name = displayName ?: runCatching { device.name }.getOrNull() ?: "Symphony LED"
-        _state.update {
-            it.copy(
-                status = BleConnectionStatus.CONNECTING,
-                connectedAddress = address,
-                connectedName = name,
-                statusMessage = null,
-            )
-        }
+        val name = displayName ?: runCatching { device.name }.getOrNull() ?: "LEDCAR"
+        val node = BleNode(
+            address = address,
+            name = name,
+            status = BleConnectionStatus.CONNECTING,
+            detectedProfile = LedProtocol.detectProfile(name, null),
+        )
+        nodes[address] = node
+        publishNodesState()
 
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        val callback = createGattCallback(address)
+        node.gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         } else {
-            device.connectGatt(context, false, gattCallback)
+            device.connectGatt(context, false, callback)
         }
     }
 
-    fun disconnect() {
-        userDisconnected = true
-        closeGattInternal()
-        _state.update {
-            it.copy(
-                status = BleConnectionStatus.DISCONNECTED,
-                activeCharUuid = null,
-                statusMessage = null,
-            )
+    fun disconnect(address: String) {
+        manuallyDisconnectedAddresses.add(address)
+        closeNodeInternal(address)
+        publishNodesState()
+    }
+
+    fun disconnectAll() {
+        nodes.keys.toList().forEach { addr ->
+            manuallyDisconnectedAddresses.add(addr)
+            closeNodeInternal(addr)
         }
+        publishNodesState()
     }
 
     @SuppressLint("MissingPermission")
-    private fun closeGattInternal() {
-        writeChar = null
-        lastColorBytesSent = null
-        val old = gatt
-        gatt = null
-        if (old != null && hasBleConnectPermission()) {
+    private fun closeNodeInternal(address: String) {
+        val node = nodes.remove(address) ?: return
+        node.writerJob?.cancel()
+        node.writerJob = null
+        node.writeChar = null
+        node.lastColorPacket = null
+        val oldGatt = node.gatt
+        node.gatt = null
+        if (oldGatt != null && hasBleConnectPermission()) {
             runCatching {
-                old.disconnect()
-                old.close()
+                oldGatt.disconnect()
+                oldGatt.close()
             }
         }
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
+    private fun publishNodesState(errorMsg: String? = null) {
+        val snapshot = nodes.values.associate { n ->
+            n.address to ConnectedDeviceInfo(
+                address = n.address,
+                name = n.name,
+                status = n.status,
+                activeCharUuid = n.activeCharUuid,
+                detectedProfile = n.detectedProfile,
+            )
+        }
+        _state.update {
+            it.copy(
+                devicesByAddress = snapshot,
+                statusMessage = errorMsg ?: it.statusMessage,
+            )
+        }
+    }
+
+    private fun createGattCallback(address: String) = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            val node = nodes[address] ?: return
+            if (node.gatt !== g) return
+
             if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-                _state.update { it.copy(status = BleConnectionStatus.DISCOVERING) }
+                node.status = BleConnectionStatus.DISCOVERING
+                publishNodesState()
                 runCatching {
-                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                    // BALANCED keeps dual simultaneous TS10 BLE connections rock-solid without choking
+                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
                     g.discoverServices()
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                writeChar = null
-                lastColorBytesSent = null
-                runCatching { g.close() }
-                if (gatt === g) gatt = null
-                _state.update {
-                    it.copy(
-                        status = BleConnectionStatus.DISCONNECTED,
-                        activeCharUuid = null,
-                        statusMessage = if (status != BluetoothGatt.GATT_SUCCESS) {
-                            "Desconectado (código $status)"
-                        } else null,
-                    )
-                }
+                closeNodeInternal(address)
+                publishNodesState(
+                    if (status != BluetoothGatt.GATT_SUCCESS && status != 0) {
+                        "${node.name} desconectado (código $status)"
+                    } else null
+                )
             }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            val node = nodes[address] ?: return
+            if (node.gatt !== g) return
+
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                _state.update {
-                    it.copy(
-                        status = BleConnectionStatus.DISCONNECTED,
-                        statusMessage = "Error al descubrir servicios GATT ($status)",
-                    )
-                }
+                closeNodeInternal(address)
+                publishNodesState("Error GATT en ${node.name} ($status)")
                 return
             }
 
@@ -358,68 +427,94 @@ class SymphonyBleManager(private val context: Context) {
             } ?: writable.firstOrNull()
 
             if (chosen == null) {
-                _state.update {
-                    it.copy(
-                        status = BleConnectionStatus.DISCONNECTED,
-                        statusMessage = "El dispositivo no expone característica LED escribible",
-                    )
-                }
-                closeGattInternal()
+                closeNodeInternal(address)
+                publishNodesState("${node.name} no tiene característica LED escribible")
                 return
             }
 
-            writeChar = chosen
             val uuidStr = chosen.uuid.toString()
-            val detected = LedProtocol.detectProfile(_state.value.connectedName, uuidStr)
-            _state.update {
-                it.copy(
-                    status = BleConnectionStatus.CONNECTED,
-                    activeCharUuid = uuidStr,
-                    detectedProfile = detected,
-                    statusMessage = null,
-                )
+            node.writeChar = chosen
+            node.activeCharUuid = uuidStr
+            node.detectedProfile = LedProtocol.detectProfile(node.name, uuidStr)
+            node.status = BleConnectionStatus.CONNECTED
+            startNodeWriterLoop(node)
+            _state.update { it.copy(statusMessage = null) }
+            publishNodesState()
+        }
+    }
+
+    private fun startNodeWriterLoop(node: BleNode) {
+        node.writerJob?.cancel()
+        node.writerJob = scope.launch {
+            while (isActive && node.status == BleConnectionStatus.CONNECTED) {
+                val ctrl = node.controlChannel.tryReceive().getOrNull()
+                if (ctrl != null) {
+                    writeBytesToNode(node, ctrl)
+                    // Safe 95ms pacing so cheap LEDCAR-01 microcontrollers never buffer-overflow or reboot
+                    delay(95L)
+                    continue
+                }
+                val color = node.colorChannel.tryReceive().getOrNull()
+                if (color != null) {
+                    writeBytesToNode(node, color)
+                    delay(95L)
+                    continue
+                }
+                delay(24L)
             }
         }
     }
 
-    fun sendControlPacket(bytes: ByteArray) {
-        if (!_state.value.isConnected) return
-        controlChannel.trySend(bytes)
+    fun sendPowerAll(on: Boolean) {
+        nodes.values.forEach { node ->
+            if (node.status == BleConnectionStatus.CONNECTED) {
+                val profile = effectiveProfileFor(node)
+                node.lastColorPacket = null
+                LedProtocol.buildPowerPackets(profile, on).forEach { pkt ->
+                    node.controlChannel.trySend(pkt)
+                }
+            }
+        }
     }
 
-    fun sendLiveColor(argb: Int, brightnessPercent: Int) {
-        if (!_state.value.isConnected) return
-        val packet = LedProtocol.buildColorPacket(effectiveProfile(), argb, brightnessPercent)
-        val prev = lastColorBytesSent
-        if (prev != null && prev.contentEquals(packet)) return
-        lastColorBytesSent = packet
-        colorChannel.trySend(packet)
+    fun sendControlPacketsAll(buildForProfile: (ProtocolProfile) -> ByteArray?) {
+        nodes.values.forEach { node ->
+            if (node.status == BleConnectionStatus.CONNECTED) {
+                val pkt = buildForProfile(effectiveProfileFor(node))
+                if (pkt != null) {
+                    node.controlChannel.trySend(pkt)
+                }
+            }
+        }
     }
 
-    private fun startWriterLoop() {
-        scope.launch {
-            while (true) {
-                val ctrl = controlChannel.tryReceive().getOrNull()
-                if (ctrl != null) {
-                    writeBytesInternal(ctrl)
-                    delay(28L)
-                    continue
-                }
-                val color = colorChannel.tryReceive().getOrNull()
-                if (color != null) {
-                    writeBytesInternal(color)
-                    delay(35L)
-                    continue
-                }
-                delay(16L)
+    fun sendLiveColorAll(
+        argb: Int,
+        brightnessPercent: Int,
+        colorOrder: ColorOrder,
+        pureLedCalibration: Boolean,
+    ) {
+        nodes.values.forEach { node ->
+            if (node.status == BleConnectionStatus.CONNECTED) {
+                val packet = LedProtocol.buildColorPacket(
+                    profile = effectiveProfileFor(node),
+                    argb = argb,
+                    brightnessPercent = brightnessPercent,
+                    colorOrder = colorOrder,
+                    pureLedCalibration = pureLedCalibration,
+                )
+                val prev = node.lastColorPacket
+                if (prev != null && prev.contentEquals(packet)) return@forEach
+                node.lastColorPacket = packet
+                node.colorChannel.trySend(packet)
             }
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun writeBytesInternal(bytes: ByteArray) {
-        val currentGatt = gatt ?: return
-        val char = writeChar ?: return
+    private fun writeBytesToNode(node: BleNode, bytes: ByteArray) {
+        val currentGatt = node.gatt ?: return
+        val char = node.writeChar ?: return
         if (!hasBleConnectPermission()) return
 
         val writeType =
@@ -457,6 +552,6 @@ class SymphonyBleManager(private val context: Context) {
 
     fun shutdown() {
         stopScan()
-        closeGattInternal()
+        nodes.keys.toList().forEach { closeNodeInternal(it) }
     }
 }

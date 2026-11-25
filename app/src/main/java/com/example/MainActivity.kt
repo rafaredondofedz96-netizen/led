@@ -310,8 +310,11 @@ private fun ActiveTabContent(
             onRequestScan = onRequestScan,
             onStopScan = viewModel::stopBleScan,
             onConnectDevice = onConnectDevice,
-            onDisconnect = viewModel::disconnectBleDevice,
+            onDisconnectDevice = viewModel::disconnectBleDevice,
+            onDisconnectAll = viewModel::disconnectAllBle,
             onSelectProtocol = viewModel::setProtocolProfile,
+            onSelectColorOrder = viewModel::setColorOrder,
+            onTogglePureCalibration = viewModel::setPureLedCalibration,
             onToggleAutoConnect = viewModel::setAutoConnectBle,
         )
 

@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import com.example.ble.BleConnectionStatus
 import com.example.ble.BleUiState
+import com.example.ble.ColorOrder
 import com.example.ble.LedProtocol
 import com.example.ble.ProtocolProfile
 import com.example.ble.SymphonyBleManager
@@ -33,6 +34,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 
 data class LivePlaybackState(
@@ -70,6 +72,7 @@ class SyncEngine(
     private var lastTrackKey: String? = null
     private var lastCoverUrl: String? = null
     private var autoConnectAttempted = false
+    private var prevConnectedCount = 0
 
     init {
         scope.launch {
@@ -79,12 +82,11 @@ class SyncEngine(
 
                 if (!autoConnectAttempted &&
                     saved.autoConnectBle &&
-                    saved.lastBleAddress.isNotBlank() &&
-                    bleManager.hasBleConnectPermission() &&
-                    bleState.value.status == BleConnectionStatus.DISCONNECTED
+                    saved.savedBleDevices.isNotEmpty() &&
+                    bleManager.hasBleConnectPermission()
                 ) {
                     autoConnectAttempted = true
-                    bleManager.connect(saved.lastBleAddress, saved.lastBleName)
+                    connectAllSavedDevicesStaggered()
                 }
 
                 ensureLoopsState(saved)
@@ -93,24 +95,49 @@ class SyncEngine(
 
         scope.launch {
             bleState.collectLatest { ble ->
-                if (ble.isConnected) {
-                    reconnectJob?.cancel()
-                    reconnectJob = null
+                val count = ble.connectedCount
+                if (count > prevConnectedCount) {
                     val saved = _prefs.value
-                    // Immediately push current power & active color/effect on connect
-                    bleManager.sendControlPacket(
-                        LedProtocol.buildPowerPacket(bleManager.effectiveProfile(), saved.powerOn)
-                    )
+                    bleManager.sendPowerAll(saved.powerOn)
                     if (saved.powerOn) {
-                        if (saved.syncEnabled) {
-                            bleManager.sendLiveColor(_playback.value.liveLedArgb, saved.brightness)
+                        delay(110L)
+                        val targetColor = if (saved.syncEnabled) {
+                            _playback.value.liveLedArgb
                         } else {
-                            bleManager.sendLiveColor(saved.manualColorArgb, saved.brightness)
+                            saved.manualColorArgb
                         }
+                        bleManager.sendLiveColorAll(
+                            argb = targetColor,
+                            brightnessPercent = saved.brightness,
+                            colorOrder = saved.colorOrder,
+                            pureLedCalibration = saved.pureLedCalibration,
+                        )
                     }
                     syncForegroundServiceState()
-                } else if (ble.status == BleConnectionStatus.DISCONNECTED) {
+                }
+                prevConnectedCount = count
+
+                val saved = _prefs.value
+                val hasDisconnectedSaved = saved.savedBleDevices.any { dev ->
+                    !bleManager.isManuallyDisconnected(dev.address) &&
+                        ble.devicesByAddress[dev.address]?.status == null
+                }
+                if (saved.autoConnectBle && hasDisconnectedSaved) {
                     scheduleAutoReconnectIfNeeded()
+                }
+            }
+        }
+    }
+
+    private fun connectAllSavedDevicesStaggered() {
+        scope.launch {
+            val saved = _prefs.value.savedBleDevices
+            saved.forEachIndexed { idx, dev ->
+                if (!bleManager.isManuallyDisconnected(dev.address) &&
+                    bleManager.hasBleConnectPermission()
+                ) {
+                    if (idx > 0) delay(250L) // Stagger dual GATT connect so TS10 BLE doesn't collide
+                    bleManager.connect(dev.address, dev.name)
                 }
             }
         }
@@ -119,28 +146,29 @@ class SyncEngine(
     private fun scheduleAutoReconnectIfNeeded() {
         val saved = _prefs.value
         if (!saved.autoConnectBle ||
-            saved.lastBleAddress.isBlank() ||
-            bleManager.userDisconnected ||
+            saved.savedBleDevices.isEmpty() ||
             !bleManager.hasBleConnectPermission()
         ) {
             return
         }
         if (reconnectJob?.isActive == true) return
         reconnectJob = scope.launch {
-            var delayMs = 3500L
+            var delayMs = 4000L
             while (isActive) {
                 delay(delayMs)
                 val currentSaved = _prefs.value
+                if (!currentSaved.autoConnectBle || !bleManager.hasBleConnectPermission()) break
+
                 val currentBle = bleState.value
-                if (!currentSaved.autoConnectBle ||
-                    currentSaved.lastBleAddress.isBlank() ||
-                    bleManager.userDisconnected ||
-                    currentBle.status != BleConnectionStatus.DISCONNECTED
-                ) {
-                    break
+                val pending = currentSaved.savedBleDevices.filter { dev ->
+                    !bleManager.isManuallyDisconnected(dev.address) &&
+                        currentBle.devicesByAddress[dev.address] == null
                 }
-                if (bleManager.hasBleConnectPermission()) {
-                    bleManager.connect(currentSaved.lastBleAddress, currentSaved.lastBleName)
+                if (pending.isEmpty()) break
+
+                pending.forEachIndexed { i, dev ->
+                    if (i > 0) delay(250L)
+                    bleManager.connect(dev.address, dev.name)
                 }
                 delayMs = (delayMs * 2L).coerceAtMost(12_000L)
             }
@@ -158,7 +186,7 @@ class SyncEngine(
 
         val shouldAnimateCover = saved.syncEnabled &&
             saved.powerOn &&
-            saved.coverSyncStyle != CoverSyncStyle.SOLID_PRIMARY
+            saved.coverSyncStyle == CoverSyncStyle.DUAL_BREATHING
         if (shouldAnimateCover && animationJob?.isActive != true) {
             startCoverAnimationLoop()
         } else if (!shouldAnimateCover) {
@@ -168,12 +196,21 @@ class SyncEngine(
                 val primary = _playback.value.palette.primaryArgb
                 _playback.update { it.copy(liveLedArgb = primary) }
                 if (saved.powerOn) {
-                    bleManager.sendLiveColor(primary, saved.brightness)
+                    sendColorWithPrefs(primary, saved)
                 }
             }
         }
 
         syncForegroundServiceState()
+    }
+
+    private fun sendColorWithPrefs(argb: Int, saved: SavedAppPrefs = _prefs.value) {
+        bleManager.sendLiveColorAll(
+            argb = argb,
+            brightnessPercent = saved.brightness,
+            colorOrder = saved.colorOrder,
+            pureLedCalibration = saved.pureLedCalibration,
+        )
     }
 
     private fun startSpotifyPollingLoop() {
@@ -211,7 +248,7 @@ class SyncEngine(
                         }
 
                         if (isNewTrack && saved.powerOn && saved.syncEnabled) {
-                            bleManager.sendLiveColor(updatedPalette.primaryArgb, saved.brightness)
+                            sendColorWithPrefs(updatedPalette.primaryArgb, saved)
                         }
 
                         delay(saved.pollIntervalMs)
@@ -249,44 +286,41 @@ class SyncEngine(
         animationJob?.cancel()
         animationJob = scope.launch {
             var phase = 0f
+            var lastDispatchedArgb = 0
             while (isActive) {
                 val saved = _prefs.value
-                if (!saved.syncEnabled || !saved.powerOn || saved.coverSyncStyle == CoverSyncStyle.SOLID_PRIMARY) {
+                if (!saved.syncEnabled || !saved.powerOn || saved.coverSyncStyle != CoverSyncStyle.DUAL_BREATHING) {
                     break
                 }
 
                 val currentTrack = _playback.value.track
                 val pal = _playback.value.palette
-                val targetArgb = if (currentTrack?.isPlaying == false) {
+                val targetArgb = if (currentTrack?.isPlaying == false || pal.primaryArgb == pal.secondaryArgb) {
                     pal.primaryArgb
                 } else {
-                    when (saved.coverSyncStyle) {
-                        CoverSyncStyle.SOLID_PRIMARY -> pal.primaryArgb
-                        CoverSyncStyle.DUAL_BREATHING -> {
-                            val t = ((1.0 - cos(phase * 2.0 * PI)) * 0.5).toFloat()
-                            AlbumPaletteExtractor.lerpRgb(pal.primaryArgb, pal.secondaryArgb, t)
-                        }
-                        CoverSyncStyle.TRIPLE_FLOW -> {
-                            val p = (phase % 1f) * 3f
-                            when {
-                                p < 1f -> AlbumPaletteExtractor.lerpRgb(pal.primaryArgb, pal.secondaryArgb, p)
-                                p < 2f -> AlbumPaletteExtractor.lerpRgb(pal.secondaryArgb, pal.ambientArgb, p - 1f)
-                                else -> AlbumPaletteExtractor.lerpRgb(pal.ambientArgb, pal.primaryArgb, p - 2f)
-                            }
-                        }
-                    }
+                    val t = ((1.0 - cos(phase * 2.0 * PI)) * 0.5).toFloat()
+                    AlbumPaletteExtractor.lerpRgb(pal.primaryArgb, pal.secondaryArgb, t)
                 }
 
                 _playback.update { it.copy(liveLedArgb = targetArgb) }
-                if (bleState.value.isConnected) {
-                    bleManager.sendLiveColor(targetArgb, saved.brightness)
+                if (bleState.value.isConnected && colorDelta(targetArgb, lastDispatchedArgb) >= 10) {
+                    lastDispatchedArgb = targetArgb
+                    sendColorWithPrefs(targetArgb, saved)
                 }
 
-                val speedFactor = 0.008f + (saved.effectSpeed / 100f) * 0.025f
+                val speedFactor = 0.012f + (saved.effectSpeed / 100f) * 0.032f
                 phase = (phase + speedFactor) % 1f
-                delay(65L) // ~15 FPS smooth automotive ambient transition, zero BLE congestion
+                // Safe 140ms pacing keeps dual LEDCAR-01 controllers smooth and crash-free
+                delay(140L)
             }
         }
+    }
+
+    private fun colorDelta(a: Int, b: Int): Int {
+        val dr = abs(((a shr 16) and 0xFF) - ((b shr 16) and 0xFF))
+        val dg = abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF))
+        val db = abs((a and 0xFF) - (b and 0xFF))
+        return dr + dg + db
     }
 
     fun ensureBackgroundServiceFromForeground() {
@@ -318,13 +352,12 @@ class SyncEngine(
     fun togglePower(on: Boolean) {
         scope.launch {
             prefsStore.setPowerOn(on)
-            val profile = bleManager.effectiveProfile()
-            bleManager.sendControlPacket(LedProtocol.buildPowerPacket(profile, on))
+            bleManager.sendPowerAll(on)
             if (on) {
-                delay(40L)
+                delay(180L)
                 val saved = _prefs.value
                 val target = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
-                bleManager.sendLiveColor(target, saved.brightness)
+                sendColorWithPrefs(target, saved)
             }
         }
     }
@@ -333,13 +366,14 @@ class SyncEngine(
         val clamped = percent.coerceIn(5, 100)
         scope.launch {
             prefsStore.setBrightness(clamped)
-            val profile = bleManager.effectiveProfile()
-            val brPacket = LedProtocol.buildBrightnessPacket(profile, clamped)
-            if (brPacket != null) {
-                bleManager.sendControlPacket(brPacket)
-            } else if (_prefs.value.powerOn) {
-                val color = if (_prefs.value.syncEnabled) _playback.value.liveLedArgb else _prefs.value.manualColorArgb
-                bleManager.sendLiveColor(color, clamped)
+            bleManager.sendControlPacketsAll { profile ->
+                LedProtocol.buildBrightnessPacket(profile, clamped)
+            }
+            if (_prefs.value.powerOn) {
+                delay(100L)
+                val saved = _prefs.value
+                val color = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
+                sendColorWithPrefs(color, saved.copy(brightness = clamped))
             }
         }
     }
@@ -348,8 +382,8 @@ class SyncEngine(
         val clamped = percent.coerceIn(5, 100)
         scope.launch {
             prefsStore.setEffectSpeed(clamped)
-            LedProtocol.buildSpeedPacket(bleManager.effectiveProfile(), clamped)?.let {
-                bleManager.sendControlPacket(it)
+            bleManager.sendControlPacketsAll { profile ->
+                LedProtocol.buildSpeedPacket(profile, clamped)
             }
         }
     }
@@ -357,14 +391,15 @@ class SyncEngine(
     fun setSyncEnabled(enabled: Boolean) {
         scope.launch {
             prefsStore.setSyncEnabled(enabled)
+            val saved = _prefs.value
             if (enabled) {
                 val primary = _playback.value.palette.primaryArgb
                 _playback.update { it.copy(liveLedArgb = primary) }
-                if (_prefs.value.powerOn) {
-                    bleManager.sendLiveColor(primary, _prefs.value.brightness)
+                if (saved.powerOn) {
+                    sendColorWithPrefs(primary, saved)
                 }
-            } else if (_prefs.value.powerOn) {
-                bleManager.sendLiveColor(_prefs.value.manualColorArgb, _prefs.value.brightness)
+            } else if (saved.powerOn) {
+                sendColorWithPrefs(saved.manualColorArgb, saved)
             }
         }
     }
@@ -381,12 +416,11 @@ class SyncEngine(
             }
             if (!_prefs.value.powerOn) {
                 prefsStore.setPowerOn(true)
-                bleManager.sendControlPacket(
-                    LedProtocol.buildPowerPacket(bleManager.effectiveProfile(), true)
-                )
+                bleManager.sendPowerAll(true)
+                delay(160L)
             }
             _playback.update { it.copy(liveLedArgb = argb) }
-            bleManager.sendLiveColor(argb, _prefs.value.brightness)
+            sendColorWithPrefs(argb, _prefs.value)
         }
     }
 
@@ -399,36 +433,60 @@ class SyncEngine(
             }
             if (!_prefs.value.powerOn) {
                 prefsStore.setPowerOn(true)
-                bleManager.sendControlPacket(
-                    LedProtocol.buildPowerPacket(bleManager.effectiveProfile(), true)
-                )
-                delay(35L)
+                bleManager.sendPowerAll(true)
+                delay(160L)
             }
-            bleManager.sendControlPacket(
-                LedProtocol.buildEffectPacket(
-                    bleManager.effectiveProfile(),
-                    effect,
-                    _prefs.value.effectSpeed,
-                )
-            )
+            val speed = _prefs.value.effectSpeed
+            bleManager.sendControlPacketsAll { profile ->
+                LedProtocol.buildEffectPacket(profile, effect, speed)
+            }
         }
     }
 
     fun connectBleDevice(address: String, name: String) {
         scope.launch {
-            prefsStore.saveLastBleDevice(address, name)
+            prefsStore.addSavedBleDevice(address, name)
             bleManager.connect(address, name)
         }
     }
 
-    fun disconnectBleDevice() {
-        bleManager.disconnect()
+    fun disconnectBleDevice(address: String) {
+        scope.launch {
+            prefsStore.removeSavedBleDevice(address)
+            bleManager.disconnect(address)
+        }
+    }
+
+    fun disconnectAllBleDevices() {
+        bleManager.disconnectAll()
     }
 
     fun setProtocolProfile(profile: ProtocolProfile) {
         scope.launch {
             prefsStore.setProtocolId(profile.id)
             bleManager.setSelectedProfile(profile)
+        }
+    }
+
+    fun setColorOrder(order: ColorOrder) {
+        scope.launch {
+            prefsStore.setColorOrder(order)
+            val saved = _prefs.value.copy(colorOrder = order)
+            if (saved.powerOn) {
+                val color = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
+                sendColorWithPrefs(color, saved)
+            }
+        }
+    }
+
+    fun setPureLedCalibration(enabled: Boolean) {
+        scope.launch {
+            prefsStore.setPureLedCalibration(enabled)
+            val saved = _prefs.value.copy(pureLedCalibration = enabled)
+            if (saved.powerOn) {
+                val color = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
+                sendColorWithPrefs(color, saved)
+            }
         }
     }
 

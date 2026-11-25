@@ -8,7 +8,9 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.ble.ColorOrder
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -18,15 +20,19 @@ private val Context.symphonyDataStore: DataStore<Preferences> by preferencesData
 )
 
 enum class CoverSyncStyle(val id: String, val label: String) {
-    SOLID_PRIMARY("solid", "Color Fijo"),
-    DUAL_BREATHING("dual", "Pulso Dual"),
-    TRIPLE_FLOW("flow", "Flujo Portada");
+    SOLID_PRIMARY("solid", "Solo Principal"),
+    DUAL_BREATHING("dual", "Pulso 2 Colores");
 
     companion object {
         fun fromId(id: String?): CoverSyncStyle =
-            entries.firstOrNull { it.id == id } ?: DUAL_BREATHING
+            entries.firstOrNull { it.id == id } ?: SOLID_PRIMARY
     }
 }
+
+data class SavedBleDevice(
+    val address: String,
+    val name: String,
+)
 
 data class SavedAppPrefs(
     val clientId: String = "",
@@ -35,14 +41,15 @@ data class SavedAppPrefs(
     val refreshToken: String = "",
     val expiresAtMs: Long = 0L,
     val spotifyUserName: String = "",
-    val lastBleAddress: String = "",
-    val lastBleName: String = "",
+    val savedBleDevices: List<SavedBleDevice> = emptyList(),
     val protocolId: String = "AUTO",
+    val colorOrder: ColorOrder = ColorOrder.RGB,
+    val pureLedCalibration: Boolean = true,
     val powerOn: Boolean = true,
     val brightness: Int = 85,
-    val effectSpeed: Int = 65,
+    val effectSpeed: Int = 55,
     val syncEnabled: Boolean = true,
-    val coverSyncStyle: CoverSyncStyle = CoverSyncStyle.DUAL_BREATHING,
+    val coverSyncStyle: CoverSyncStyle = CoverSyncStyle.SOLID_PRIMARY,
     val manualColorArgb: Int = 0xFF00E5FF.toInt(),
     val activeEffectIndex: Int = 0,
     val pollIntervalMs: Long = 1200L,
@@ -69,7 +76,10 @@ class PrefsStore(context: Context) {
         val USER_NAME = stringPreferencesKey("spotify_user_name")
         val BLE_ADDRESS = stringPreferencesKey("ble_device_address")
         val BLE_NAME = stringPreferencesKey("ble_device_name")
+        val BLE_DEVICES_SET = stringSetPreferencesKey("ble_devices_set")
         val PROTOCOL_ID = stringPreferencesKey("led_protocol_id")
+        val COLOR_ORDER = stringPreferencesKey("led_color_order")
+        val PURE_LED_CAL = booleanPreferencesKey("led_pure_calibration")
         val POWER_ON = booleanPreferencesKey("led_power_on")
         val BRIGHTNESS = intPreferencesKey("led_brightness")
         val SPEED = intPreferencesKey("led_speed")
@@ -83,6 +93,26 @@ class PrefsStore(context: Context) {
     }
 
     val prefsFlow: Flow<SavedAppPrefs> = dataStore.data.map { p ->
+        val rawSet = p[Keys.BLE_DEVICES_SET]
+        val devices = if (!rawSet.isNullOrEmpty()) {
+            rawSet.mapNotNull { entry ->
+                val idx = entry.indexOf('|')
+                if (idx <= 0) null
+                else SavedBleDevice(
+                    address = entry.substring(0, idx),
+                    name = entry.substring(idx + 1).ifBlank { "LEDCAR" },
+                )
+            }.sortedBy { it.name }
+        } else {
+            val legacyAddr = p[Keys.BLE_ADDRESS].orEmpty()
+            val legacyName = p[Keys.BLE_NAME].orEmpty()
+            if (legacyAddr.isNotBlank()) {
+                listOf(SavedBleDevice(legacyAddr, legacyName.ifBlank { "Symphony LED" }))
+            } else {
+                emptyList()
+            }
+        }
+
         SavedAppPrefs(
             clientId = p[Keys.CLIENT_ID] ?: "",
             clientSecret = p[Keys.CLIENT_SECRET] ?: "",
@@ -90,12 +120,13 @@ class PrefsStore(context: Context) {
             refreshToken = p[Keys.REFRESH_TOKEN] ?: "",
             expiresAtMs = p[Keys.EXPIRES_AT] ?: 0L,
             spotifyUserName = p[Keys.USER_NAME] ?: "",
-            lastBleAddress = p[Keys.BLE_ADDRESS] ?: "",
-            lastBleName = p[Keys.BLE_NAME] ?: "",
+            savedBleDevices = devices,
             protocolId = p[Keys.PROTOCOL_ID] ?: "AUTO",
+            colorOrder = ColorOrder.fromId(p[Keys.COLOR_ORDER]),
+            pureLedCalibration = p[Keys.PURE_LED_CAL] ?: true,
             powerOn = p[Keys.POWER_ON] ?: true,
             brightness = (p[Keys.BRIGHTNESS] ?: 85).coerceIn(5, 100),
-            effectSpeed = (p[Keys.SPEED] ?: 65).coerceIn(5, 100),
+            effectSpeed = (p[Keys.SPEED] ?: 55).coerceIn(5, 100),
             syncEnabled = p[Keys.SYNC_ENABLED] ?: true,
             coverSyncStyle = CoverSyncStyle.fromId(p[Keys.COVER_SYNC_STYLE]),
             manualColorArgb = p[Keys.MANUAL_COLOR] ?: 0xFF00E5FF.toInt(),
@@ -153,15 +184,45 @@ class PrefsStore(context: Context) {
         }
     }
 
-    suspend fun saveLastBleDevice(address: String, name: String) {
+    suspend fun addSavedBleDevice(address: String, name: String) {
         dataStore.edit { p ->
+            val current = p[Keys.BLE_DEVICES_SET]?.toMutableSet() ?: mutableSetOf()
+            // Migrate legacy single device if present
+            val legacyAddr = p[Keys.BLE_ADDRESS]
+            val legacyName = p[Keys.BLE_NAME]
+            if (!legacyAddr.isNullOrBlank() && current.none { it.startsWith("$legacyAddr|") }) {
+                current.add("$legacyAddr|${legacyName.orEmpty()}")
+            }
+            current.removeAll { it.startsWith("$address|") }
+            current.add("$address|${name.ifBlank { "LEDCAR" }}")
+            p[Keys.BLE_DEVICES_SET] = current
             p[Keys.BLE_ADDRESS] = address
             p[Keys.BLE_NAME] = name
         }
     }
 
+    suspend fun removeSavedBleDevice(address: String) {
+        dataStore.edit { p ->
+            val current = p[Keys.BLE_DEVICES_SET]?.toMutableSet() ?: mutableSetOf()
+            current.removeAll { it.startsWith("$address|") }
+            p[Keys.BLE_DEVICES_SET] = current
+            if (p[Keys.BLE_ADDRESS] == address) {
+                p.remove(Keys.BLE_ADDRESS)
+                p.remove(Keys.BLE_NAME)
+            }
+        }
+    }
+
     suspend fun setProtocolId(protocolId: String) {
         dataStore.edit { it[Keys.PROTOCOL_ID] = protocolId }
+    }
+
+    suspend fun setColorOrder(order: ColorOrder) {
+        dataStore.edit { it[Keys.COLOR_ORDER] = order.id }
+    }
+
+    suspend fun setPureLedCalibration(enabled: Boolean) {
+        dataStore.edit { it[Keys.PURE_LED_CAL] = enabled }
     }
 
     suspend fun setPowerOn(on: Boolean) {

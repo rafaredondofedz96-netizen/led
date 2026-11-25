@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.SymphonyApp
 import com.example.ble.BleUiState
+import com.example.ble.ColorOrder
 import com.example.ble.ProtocolProfile
 import com.example.core.LivePlaybackState
 import com.example.data.CoverSyncStyle
@@ -59,8 +60,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun stopBleScan() = engine.bleManager.stopScan()
 
     fun connectBleDevice(address: String, name: String) = engine.connectBleDevice(address, name)
-    fun disconnectBleDevice() = engine.disconnectBleDevice()
+    fun disconnectBleDevice(address: String) = engine.disconnectBleDevice(address)
+    fun disconnectAllBle() = engine.disconnectAllBleDevices()
     fun setProtocolProfile(profile: ProtocolProfile) = engine.setProtocolProfile(profile)
+    fun setColorOrder(order: ColorOrder) = engine.setColorOrder(order)
+    fun setPureLedCalibration(enabled: Boolean) = engine.setPureLedCalibration(enabled)
     fun setAutoConnectBle(enabled: Boolean) = engine.setAutoConnectBle(enabled)
 
     fun togglePower(on: Boolean) = engine.togglePower(on)
