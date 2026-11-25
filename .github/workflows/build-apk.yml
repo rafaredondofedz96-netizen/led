@@ -67,10 +67,40 @@ jobs:
           path: SymphonySync-v${{ steps.version.outputs.version }}.apk
 
       - name: Publish GitHub Release with APK
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: SymphonySync v${{ steps.version.outputs.version }}
-          body: "APK compilada automáticamente desde GitHub Actions para radio Android TS10."
-          files: SymphonySync-v${{ steps.version.outputs.version }}.apk
-          make_latest: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          APK="SymphonySync-v${{ steps.version.outputs.version }}.apk"
+          TITLE="SymphonySync ${TAG}"
+          NOTES="APK compilada automáticamente desde GitHub Actions para radio Android TS10."
+
+          for attempt in 1 2 3 4 5; do
+            echo "Publicando Release ${TAG} (intento ${attempt}/5)..."
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              if gh release upload "$TAG" "$APK" --clobber && \
+                 gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --latest; then
+                echo "Release ${TAG} actualizada correctamente."
+                exit 0
+              fi
+            else
+              if gh release create "$TAG" "$APK" \
+                 --target "${{ github.sha }}" \
+                 --title "$TITLE" \
+                 --notes "$NOTES" \
+                 --latest; then
+                echo "Release ${TAG} creada correctamente."
+                exit 0
+              fi
+            fi
+
+            if [ "$attempt" -lt 5 ]; then
+              WAIT=$((attempt * 10))
+              echo "Error temporal de GitHub API; reintentando en ${WAIT}s..."
+              sleep "$WAIT"
+            fi
+          done
+
+          echo "No se pudo publicar la Release tras 5 intentos (el APK sigue disponible en Artifacts)."
+          exit 1
