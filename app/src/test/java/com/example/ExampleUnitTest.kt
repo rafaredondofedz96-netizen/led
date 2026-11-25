@@ -107,13 +107,33 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun `ledcar 01 brightness and speed restore packets match 7B FF spec`() {
+        val brightnessPkt = LedProtocol.buildBrightnessPacket(ProtocolProfile.LEDCAR_01, 50)
+        val speedPkt = LedProtocol.buildSpeedPacket(ProtocolProfile.LEDCAR_01, 50)
+        assertEquals(0x7B.toByte(), brightnessPkt!![0])
+        assertEquals(0x01.toByte(), brightnessPkt[2])
+        assertEquals(16.toByte(), brightnessPkt[3])
+        assertEquals(0xBF.toByte(), brightnessPkt[8])
+        assertEquals(0x02.toByte(), speedPkt!![2])
+        assertEquals(16.toByte(), speedPkt[3])
+    }
+
+    @Test
+    fun `saved app prefs default to auto connect and auto open on car start`() {
+        val defaults = com.example.data.SavedAppPrefs()
+        assertTrue(defaults.autoConnectBle)
+        assertTrue(defaults.autoOpenOnCarStart)
+        assertFalse(defaults.manualEffectActive)
+    }
+
+    @Test
     fun `github update checker normalizes url and compares semver`() {
         assertEquals(
             "rafa/SymphonySync",
             GitHubUpdateChecker.normalizeRepoInput("https://github.com/rafa/SymphonySync.git"),
         )
-        assertTrue(GitHubUpdateChecker.isNewerVersion("1.3.0", "1.2.0"))
-        assertFalse(GitHubUpdateChecker.isNewerVersion("1.2.0", "1.2.0"))
-        assertFalse(GitHubUpdateChecker.isNewerVersion("1.1.9", "1.2.0"))
+        assertTrue(GitHubUpdateChecker.isNewerVersion("1.4.0", "1.3.0"))
+        assertFalse(GitHubUpdateChecker.isNewerVersion("1.3.0", "1.3.0"))
+        assertFalse(GitHubUpdateChecker.isNewerVersion("1.2.0", "1.3.0"))
     }
 }

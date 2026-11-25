@@ -83,7 +83,9 @@ fun LedLampControlScreen(
                     .verticalScroll(rememberScrollState()),
             )
             SymphonyEffectsGridPanel(
-                activeEffectIndex = if (state.prefs.syncEnabled) -1 else state.prefs.activeEffectIndex,
+                activeEffectIndex = if (!state.prefs.syncEnabled && state.prefs.manualEffectActive) {
+                    state.prefs.activeEffectIndex
+                } else -1,
                 onSelectEffect = onSelectEffect,
                 modifier = Modifier
                     .weight(1.1f)
@@ -108,7 +110,9 @@ fun LedLampControlScreen(
                 onSpeedChange = onSpeedChange,
             )
             SymphonyEffectsListColumn(
-                activeEffectIndex = if (state.prefs.syncEnabled) -1 else state.prefs.activeEffectIndex,
+                activeEffectIndex = if (!state.prefs.syncEnabled && state.prefs.manualEffectActive) {
+                    state.prefs.activeEffectIndex
+                } else -1,
                 onSelectEffect = onSelectEffect,
             )
             Spacer(modifier = Modifier.height(8.dp))

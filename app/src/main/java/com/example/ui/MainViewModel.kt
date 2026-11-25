@@ -66,6 +66,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setColorOrder(order: ColorOrder) = engine.setColorOrder(order)
     fun setPureLedCalibration(enabled: Boolean) = engine.setPureLedCalibration(enabled)
     fun setAutoConnectBle(enabled: Boolean) = engine.setAutoConnectBle(enabled)
+    fun setAutoOpenOnCarStart(enabled: Boolean) = engine.setAutoOpenOnCarStart(enabled)
 
     fun togglePower(on: Boolean) = engine.togglePower(on)
     fun setBrightness(percent: Int) = engine.setBrightness(percent)

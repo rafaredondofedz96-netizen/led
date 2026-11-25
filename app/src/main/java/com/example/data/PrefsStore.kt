@@ -51,9 +51,12 @@ data class SavedAppPrefs(
     val syncEnabled: Boolean = true,
     val coverSyncStyle: CoverSyncStyle = CoverSyncStyle.SOLID_PRIMARY,
     val manualColorArgb: Int = 0xFF00E5FF.toInt(),
+    val manualEffectActive: Boolean = false,
+    val lastLiveLedArgb: Int = 0xFF00E5FF.toInt(),
     val activeEffectIndex: Int = 0,
     val pollIntervalMs: Long = 1200L,
     val autoConnectBle: Boolean = true,
+    val autoOpenOnCarStart: Boolean = true,
     val githubRepo: String = "",
 ) {
     val hasSpotifyCredentials: Boolean
@@ -86,9 +89,12 @@ class PrefsStore(context: Context) {
         val SYNC_ENABLED = booleanPreferencesKey("sync_enabled")
         val COVER_SYNC_STYLE = stringPreferencesKey("cover_sync_style")
         val MANUAL_COLOR = intPreferencesKey("manual_color_rgb")
+        val MANUAL_EFFECT_ACTIVE = booleanPreferencesKey("manual_effect_active")
+        val LAST_LIVE_LED = intPreferencesKey("last_live_led_rgb")
         val ACTIVE_EFFECT = intPreferencesKey("active_symphony_effect")
         val POLL_INTERVAL = longPreferencesKey("poll_interval_ms")
         val AUTO_CONNECT_BLE = booleanPreferencesKey("auto_connect_ble")
+        val AUTO_OPEN_ON_CAR_START = booleanPreferencesKey("auto_open_on_car_start")
         val GITHUB_REPO = stringPreferencesKey("github_repo")
     }
 
@@ -130,9 +136,12 @@ class PrefsStore(context: Context) {
             syncEnabled = p[Keys.SYNC_ENABLED] ?: true,
             coverSyncStyle = CoverSyncStyle.fromId(p[Keys.COVER_SYNC_STYLE]),
             manualColorArgb = p[Keys.MANUAL_COLOR] ?: 0xFF00E5FF.toInt(),
+            manualEffectActive = p[Keys.MANUAL_EFFECT_ACTIVE] ?: false,
+            lastLiveLedArgb = p[Keys.LAST_LIVE_LED] ?: (p[Keys.MANUAL_COLOR] ?: 0xFF00E5FF.toInt()),
             activeEffectIndex = p[Keys.ACTIVE_EFFECT] ?: 0,
             pollIntervalMs = (p[Keys.POLL_INTERVAL] ?: 1200L).coerceIn(800L, 5000L),
             autoConnectBle = p[Keys.AUTO_CONNECT_BLE] ?: true,
+            autoOpenOnCarStart = p[Keys.AUTO_OPEN_ON_CAR_START] ?: true,
             githubRepo = p[Keys.GITHUB_REPO] ?: "",
         )
     }
@@ -249,6 +258,14 @@ class PrefsStore(context: Context) {
         dataStore.edit { it[Keys.MANUAL_COLOR] = argb }
     }
 
+    suspend fun setManualEffectActive(active: Boolean) {
+        dataStore.edit { it[Keys.MANUAL_EFFECT_ACTIVE] = active }
+    }
+
+    suspend fun setLastLiveLedArgb(argb: Int) {
+        dataStore.edit { it[Keys.LAST_LIVE_LED] = argb }
+    }
+
     suspend fun setActiveEffectIndex(index: Int) {
         dataStore.edit { it[Keys.ACTIVE_EFFECT] = index }
     }
@@ -259,6 +276,10 @@ class PrefsStore(context: Context) {
 
     suspend fun setAutoConnectBle(enabled: Boolean) {
         dataStore.edit { it[Keys.AUTO_CONNECT_BLE] = enabled }
+    }
+
+    suspend fun setAutoOpenOnCarStart(enabled: Boolean) {
+        dataStore.edit { it[Keys.AUTO_OPEN_ON_CAR_START] = enabled }
     }
 
     suspend fun saveGithubRepo(repo: String) {

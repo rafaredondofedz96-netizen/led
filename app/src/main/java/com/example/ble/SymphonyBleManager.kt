@@ -119,6 +119,7 @@ class SymphonyBleManager(private val context: Context) {
         val controlChannel: Channel<ByteArray> = Channel(capacity = 12),
         val colorChannel: Channel<ByteArray> = Channel(capacity = Channel.CONFLATED),
         var writerJob: Job? = null,
+        var connectTimeoutJob: Job? = null,
     )
 
     private val nodes = ConcurrentHashMap<String, BleNode>()
@@ -177,6 +178,28 @@ class SymphonyBleManager(private val context: Context) {
                 isBluetoothSupported = bt != null,
                 isBluetoothEnabled = bt?.isEnabled == true,
             )
+        }
+    }
+
+    fun handleBluetoothAdapterStateChanged(isEnabled: Boolean) {
+        if (!isEnabled) {
+            // Clear stale GATT nodes without marking manually disconnected so ACC-ON reconnects cleanly
+            nodes.keys.toList().forEach { closeNodeInternal(it) }
+            publishNodesState()
+            _state.update {
+                it.copy(
+                    isScanning = false,
+                    isBluetoothEnabled = false,
+                    statusMessage = "Bluetooth apagado (esperando encendido del coche)",
+                )
+            }
+        } else {
+            _state.update {
+                it.copy(
+                    isBluetoothEnabled = true,
+                    statusMessage = null,
+                )
+            }
         }
     }
 
@@ -331,6 +354,14 @@ class SymphonyBleManager(private val context: Context) {
         } else {
             device.connectGatt(context, false, callback)
         }
+        node.connectTimeoutJob = scope.launch {
+            delay(10_000L)
+            val current = nodes[address]
+            if (current === node && current.status != BleConnectionStatus.CONNECTED) {
+                closeNodeInternal(address)
+                publishNodesState()
+            }
+        }
     }
 
     fun disconnect(address: String) {
@@ -350,6 +381,8 @@ class SymphonyBleManager(private val context: Context) {
     @SuppressLint("MissingPermission")
     private fun closeNodeInternal(address: String) {
         val node = nodes.remove(address) ?: return
+        node.connectTimeoutJob?.cancel()
+        node.connectTimeoutJob = null
         node.writerJob?.cancel()
         node.writerJob = null
         node.writeChar = null
@@ -433,6 +466,8 @@ class SymphonyBleManager(private val context: Context) {
             }
 
             val uuidStr = chosen.uuid.toString()
+            node.connectTimeoutJob?.cancel()
+            node.connectTimeoutJob = null
             node.writeChar = chosen
             node.activeCharUuid = uuidStr
             node.detectedProfile = LedProtocol.detectProfile(node.name, uuidStr)

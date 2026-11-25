@@ -46,9 +46,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,6 +69,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.BuildConfig
 import com.example.R
 import com.example.spotify.SpotifyRepository
@@ -90,6 +95,7 @@ fun SpotifyAccountScreen(
     onSelectPollInterval: (Long) -> Unit,
     onLogout: (Boolean) -> Unit,
     onCheckGithubUpdates: (String) -> Unit,
+    onToggleAutoOpenOnCarStart: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
@@ -150,6 +156,7 @@ fun SpotifyAccountScreen(
                 state = state,
                 onSelectPollInterval = onSelectPollInterval,
                 onCheckGithubUpdates = onCheckGithubUpdates,
+                onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
                 onCopyRedirectUri = {
                     clipboard.setText(AnnotatedString(SpotifyRepository.REDIRECT_URI))
                     Toast.makeText(context, R.string.uri_copied, Toast.LENGTH_SHORT).show()
@@ -187,6 +194,7 @@ fun SpotifyAccountScreen(
                 state = state,
                 onSelectPollInterval = onSelectPollInterval,
                 onCheckGithubUpdates = onCheckGithubUpdates,
+                onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
                 onCopyRedirectUri = {
                     clipboard.setText(AnnotatedString(SpotifyRepository.REDIRECT_URI))
                     Toast.makeText(context, R.string.uri_copied, Toast.LENGTH_SHORT).show()
@@ -412,6 +420,7 @@ private fun GuideAndPerformanceColumn(
     state: MainUiState,
     onSelectPollInterval: (Long) -> Unit,
     onCheckGithubUpdates: (String) -> Unit,
+    onToggleAutoOpenOnCarStart: (Boolean) -> Unit,
     onCopyRedirectUri: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -514,7 +523,10 @@ private fun GuideAndPerformanceColumn(
             onCheckUpdates = onCheckGithubUpdates,
         )
 
-        Ts10BackgroundCard()
+        Ts10BackgroundCard(
+            autoOpenOnCarStart = state.prefs.autoOpenOnCarStart,
+            onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
+        )
     }
 }
 
@@ -635,34 +647,113 @@ private fun GitHubUpdatesCard(
 }
 
 @Composable
-private fun Ts10BackgroundCard() {
+private fun Ts10BackgroundCard(
+    autoOpenOnCarStart: Boolean,
+    onToggleAutoOpenOnCarStart: (Boolean) -> Unit,
+) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val pm = remember(context) { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
-    val isUnrestricted = remember(pm, context.packageName) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            pm?.isIgnoringBatteryOptimizations(context.packageName) == true
-        } else true
+
+    var isUnrestricted by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+            } else true
+        )
+    }
+    var canDrawOverlays by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Settings.canDrawOverlays(context)
+            } else true
+        )
+    }
+
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                isUnrestricted = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+                canDrawOverlays = Settings.canDrawOverlays(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Surface(
         shape = MaterialTheme.shapes.large,
         color = CockpitSurface,
-        border = BorderStroke(1.dp, if (isUnrestricted) SpotifyGreen.copy(alpha = 0.5f) else CockpitBorder),
+        border = BorderStroke(
+            1.dp,
+            if (isUnrestricted && canDrawOverlays) SpotifyGreen.copy(alpha = 0.5f) else CockpitBorder,
+        ),
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     imageVector = Icons.Rounded.BatteryChargingFull,
                     contentDescription = null,
-                    tint = if (isUnrestricted) SpotifyGreen else NeonCyan,
+                    tint = if (isUnrestricted && canDrawOverlays) SpotifyGreen else NeonCyan,
                     modifier = Modifier.size(18.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Segundo Plano Radio TS10", style = MaterialTheme.typography.titleMedium)
+                Text("Arranque Coche y Segundo Plano (TS10)", style = MaterialTheme.typography.titleMedium)
             }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Abrir app al arrancar el coche",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        text = "Conecta ambas tiras LED y restaura tu último modo guardado",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary,
+                    )
+                }
+                Switch(
+                    checked = autoOpenOnCarStart,
+                    onCheckedChange = onToggleAutoOpenOnCarStart,
+                    modifier = Modifier.testTag("ts10_auto_open_switch"),
+                )
+            }
+
+            if (!canDrawOverlays && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}"),
+                                )
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("ts10_overlay_permission_btn"),
+                ) {
+                    Text("Permitir abrir sola al arrancar (TS10)")
+                }
+            } else {
+                Text(
+                    text = "Permiso de apertura automática al arrancar activo.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = SpotifyGreen,
+                )
+            }
+
             Text(
                 text = if (isUnrestricted) {
                     "Sin restricciones de batería: los LED siguen reaccionando al cambiar a Maps, Waze o Spotify."
@@ -688,7 +779,7 @@ private fun Ts10BackgroundCard() {
                 }
             }
             Text(
-                text = "Para actualizar la APK en tu radio TS10 cuando hagas cambios aquí, exporta/genera la nueva APK e instálala encima: conservará tu cuenta Spotify y tu tira LED.",
+                text = "Al actualizar o reiniciar la radio TS10 se conservan tu cuenta Spotify, tus controladores Bluetooth y la última configuración LED.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextMuted,
             )

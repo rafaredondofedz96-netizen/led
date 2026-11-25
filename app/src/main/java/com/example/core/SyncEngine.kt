@@ -1,10 +1,12 @@
 package com.example.core
 
+import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
-import com.example.ble.BleConnectionStatus
+import android.os.SystemClock
+import com.example.MainActivity
 import com.example.ble.BleUiState
 import com.example.ble.ColorOrder
 import com.example.ble.LedProtocol
@@ -72,7 +74,20 @@ class SyncEngine(
     private var lastTrackKey: String? = null
     private var lastCoverUrl: String? = null
     private var autoConnectAttempted = false
-    private var prevConnectedCount = 0
+    private var initialColorRestored = false
+    private var prevConnectedAddresses: Set<String> = emptySet()
+
+    @Volatile
+    private var isActivityVisible: Boolean = false
+
+    @Volatile
+    private var wasBluetoothOff: Boolean = false
+
+    @Volatile
+    private var lastScreenOffElapsedMs: Long = 0L
+
+    @Volatile
+    private var lastAutoLaunchElapsedMs: Long = 0L
 
     init {
         scope.launch {
@@ -80,13 +95,25 @@ class SyncEngine(
                 _prefs.value = saved
                 bleManager.setSelectedProfile(ProtocolProfile.fromId(saved.protocolId))
 
+                if (!initialColorRestored) {
+                    initialColorRestored = true
+                    if (_playback.value.track == null) {
+                        val restoredArgb = if (saved.syncEnabled) {
+                            saved.lastLiveLedArgb
+                        } else {
+                            saved.manualColorArgb
+                        }
+                        _playback.update { it.copy(liveLedArgb = restoredArgb) }
+                    }
+                }
+
                 if (!autoConnectAttempted &&
                     saved.autoConnectBle &&
                     saved.savedBleDevices.isNotEmpty() &&
                     bleManager.hasBleConnectPermission()
                 ) {
                     autoConnectAttempted = true
-                    connectAllSavedDevicesStaggered()
+                    connectAllSavedDevicesStaggered(saved)
                 }
 
                 ensureLoopsState(saved)
@@ -95,47 +122,76 @@ class SyncEngine(
 
         scope.launch {
             bleState.collectLatest { ble ->
-                val count = ble.connectedCount
-                if (count > prevConnectedCount) {
+                val currentConnected = ble.connectedDevices.map { it.address }.toSet()
+                val newlyConnected = currentConnected - prevConnectedAddresses
+                prevConnectedAddresses = currentConnected
+
+                if (newlyConnected.isNotEmpty()) {
                     val saved = _prefs.value
-                    bleManager.sendPowerAll(saved.powerOn)
-                    if (saved.powerOn) {
-                        delay(110L)
-                        val targetColor = if (saved.syncEnabled) {
-                            _playback.value.liveLedArgb
-                        } else {
-                            saved.manualColorArgb
-                        }
-                        bleManager.sendLiveColorAll(
-                            argb = targetColor,
-                            brightnessPercent = saved.brightness,
-                            colorOrder = saved.colorOrder,
-                            pureLedCalibration = saved.pureLedCalibration,
-                        )
-                    }
+                    restoreSavedConfigurationToControllers(saved)
                     syncForegroundServiceState()
                 }
-                prevConnectedCount = count
 
                 val saved = _prefs.value
                 val hasDisconnectedSaved = saved.savedBleDevices.any { dev ->
                     !bleManager.isManuallyDisconnected(dev.address) &&
                         ble.devicesByAddress[dev.address]?.status == null
                 }
-                if (saved.autoConnectBle && hasDisconnectedSaved) {
-                    scheduleAutoReconnectIfNeeded()
+                if (saved.autoConnectBle && ble.isBluetoothEnabled && hasDisconnectedSaved) {
+                    scheduleAutoReconnectIfNeeded(aggressiveCarStart = false)
                 }
             }
         }
     }
 
-    private fun connectAllSavedDevicesStaggered() {
+    private suspend fun restoreSavedConfigurationToControllers(saved: SavedAppPrefs) {
+        bleManager.sendPowerAll(saved.powerOn)
+        if (!saved.powerOn) return
+
+        delay(110L)
+        bleManager.sendControlPacketsAll { profile ->
+            LedProtocol.buildBrightnessPacket(profile, saved.brightness)
+        }
+        delay(95L)
+
+        when {
+            saved.syncEnabled -> {
+                val targetColor = if (_playback.value.track != null) {
+                    _playback.value.liveLedArgb
+                } else {
+                    saved.lastLiveLedArgb
+                }
+                sendColorWithPrefs(targetColor, saved)
+            }
+
+            saved.manualEffectActive -> {
+                val effect = LedProtocol.symphonyEffects.getOrNull(saved.activeEffectIndex)
+                bleManager.sendControlPacketsAll { profile ->
+                    LedProtocol.buildSpeedPacket(profile, saved.effectSpeed)
+                }
+                delay(95L)
+                if (effect != null) {
+                    bleManager.sendControlPacketsAll { profile ->
+                        LedProtocol.buildEffectPacket(profile, effect, saved.effectSpeed)
+                    }
+                } else {
+                    sendColorWithPrefs(saved.manualColorArgb, saved)
+                }
+            }
+
+            else -> {
+                sendColorWithPrefs(saved.manualColorArgb, saved)
+            }
+        }
+    }
+
+    private fun connectAllSavedDevicesStaggered(saved: SavedAppPrefs = _prefs.value) {
         scope.launch {
-            val saved = _prefs.value.savedBleDevices
-            saved.forEachIndexed { idx, dev ->
-                if (!bleManager.isManuallyDisconnected(dev.address) &&
-                    bleManager.hasBleConnectPermission()
-                ) {
+            bleManager.refreshAdapterState()
+            if (!bleState.value.isBluetoothEnabled || !bleManager.hasBleConnectPermission()) return@launch
+            val devices = saved.savedBleDevices
+            devices.forEachIndexed { idx, dev ->
+                if (!bleManager.isManuallyDisconnected(dev.address)) {
                     if (idx > 0) delay(250L) // Stagger dual GATT connect so TS10 BLE doesn't collide
                     bleManager.connect(dev.address, dev.name)
                 }
@@ -143,7 +199,7 @@ class SyncEngine(
         }
     }
 
-    private fun scheduleAutoReconnectIfNeeded() {
+    private fun scheduleAutoReconnectIfNeeded(aggressiveCarStart: Boolean) {
         val saved = _prefs.value
         if (!saved.autoConnectBle ||
             saved.savedBleDevices.isEmpty() ||
@@ -151,13 +207,28 @@ class SyncEngine(
         ) {
             return
         }
-        if (reconnectJob?.isActive == true) return
+        if (aggressiveCarStart) {
+            reconnectJob?.cancel()
+            reconnectJob = null
+        } else if (reconnectJob?.isActive == true) {
+            return
+        }
         reconnectJob = scope.launch {
-            var delayMs = 4000L
+            val steps = if (aggressiveCarStart) {
+                listOf(1500L, 2500L, 3500L, 5000L, 7000L, 10_000L)
+            } else {
+                listOf(4000L, 6000L, 9000L, 12_000L)
+            }
+            var stepIdx = 0
             while (isActive) {
-                delay(delayMs)
+                val waitMs = steps[stepIdx.coerceAtMost(steps.lastIndex)]
+                delay(waitMs)
+                stepIdx++
+
                 val currentSaved = _prefs.value
                 if (!currentSaved.autoConnectBle || !bleManager.hasBleConnectPermission()) break
+                bleManager.refreshAdapterState()
+                if (!bleState.value.isBluetoothEnabled) continue
 
                 val currentBle = bleState.value
                 val pending = currentSaved.savedBleDevices.filter { dev ->
@@ -170,7 +241,6 @@ class SyncEngine(
                     if (i > 0) delay(250L)
                     bleManager.connect(dev.address, dev.name)
                 }
-                delayMs = (delayMs * 2L).coerceAtMost(12_000L)
             }
         }
     }
@@ -233,6 +303,7 @@ class SyncEngine(
                             if (!coverUrl.isNullOrBlank() && coverUrl != lastCoverUrl) {
                                 lastCoverUrl = coverUrl
                                 updatedPalette = spotifyRepository.extractPaletteFromCoverUrl(coverUrl)
+                                prefsStore.setLastLiveLedArgb(updatedPalette.primaryArgb)
                             }
                         }
 
@@ -323,15 +394,142 @@ class SyncEngine(
         return dr + dg + db
     }
 
+    fun setActivityVisible(visible: Boolean) {
+        isActivityVisible = visible
+    }
+
+    fun onScreenOff() {
+        lastScreenOffElapsedMs = SystemClock.elapsedRealtime()
+    }
+
+    fun onBluetoothAdapterStateChanged(btState: Int) {
+        when (btState) {
+            BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                wasBluetoothOff = true
+                bleManager.handleBluetoothAdapterStateChanged(false)
+            }
+
+            BluetoothAdapter.STATE_ON -> {
+                bleManager.handleBluetoothAdapterStateChanged(true)
+                val wokeFromSleep = wasBluetoothOff
+                wasBluetoothOff = false
+                onCarStartedEvent(
+                    triggerOpenUi = wokeFromSleep,
+                    reason = "bluetooth_on",
+                )
+            }
+        }
+    }
+
+    fun onScreenOrUserWake(isUserPresent: Boolean, onComplete: (() -> Unit)? = null) {
+        val sleptLongEnough = lastScreenOffElapsedMs > 0L &&
+            (SystemClock.elapsedRealtime() - lastScreenOffElapsedMs) >= 20_000L
+        if (sleptLongEnough) {
+            lastScreenOffElapsedMs = 0L
+        }
+        onCarStartedEvent(
+            triggerOpenUi = sleptLongEnough || (isUserPresent && !bleState.value.isConnected && sleptLongEnough),
+            reason = if (isUserPresent) "user_present" else "screen_on",
+            onComplete = onComplete,
+        )
+    }
+
+    fun onCarStartedEvent(
+        triggerOpenUi: Boolean,
+        reason: String,
+        onComplete: (() -> Unit)? = null,
+    ) {
+        scope.launch {
+            try {
+                val saved = prefsStore.getSnapshot()
+                _prefs.value = saved
+                bleManager.setSelectedProfile(ProtocolProfile.fromId(saved.protocolId))
+                bleManager.refreshAdapterState()
+
+                if (_playback.value.track == null) {
+                    val restoredArgb = if (saved.syncEnabled) saved.lastLiveLedArgb else saved.manualColorArgb
+                    _playback.update { it.copy(liveLedArgb = restoredArgb) }
+                }
+
+                if (triggerOpenUi && saved.autoOpenOnCarStart) {
+                    launchMainActivityForCarStart()
+                }
+
+                syncForegroundServiceState(
+                    savedOverride = saved,
+                    forceKeepAliveForAutoConnect = saved.autoConnectBle && saved.savedBleDevices.isNotEmpty(),
+                )
+
+                if (saved.autoConnectBle &&
+                    saved.savedBleDevices.isNotEmpty() &&
+                    bleManager.hasBleConnectPermission()
+                ) {
+                    autoConnectAttempted = true
+                    connectAllSavedDevicesStaggered(saved)
+                    scheduleAutoReconnectIfNeeded(aggressiveCarStart = true)
+                }
+
+                ensureLoopsState(saved)
+            } finally {
+                onComplete?.invoke()
+            }
+        }
+    }
+
+    private fun launchMainActivityForCarStart() {
+        val now = SystemClock.elapsedRealtime()
+        if (isActivityVisible) return
+        if (now - lastAutoLaunchElapsedMs < 15_000L) return
+        lastAutoLaunchElapsedMs = now
+
+        val launchIntent = Intent(appContext, MainActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            )
+            putExtra("car_auto_start", true)
+        }
+        runCatching {
+            appContext.startActivity(launchIntent)
+        }
+    }
+
+    fun reconnectSavedDevicesIfNeeded() {
+        val saved = _prefs.value
+        bleManager.refreshAdapterState()
+        if (!saved.autoConnectBle ||
+            saved.savedBleDevices.isEmpty() ||
+            !bleManager.hasBleConnectPermission() ||
+            !bleState.value.isBluetoothEnabled
+        ) {
+            return
+        }
+        val currentBle = bleState.value
+        val hasDisconnected = saved.savedBleDevices.any { dev ->
+            !bleManager.isManuallyDisconnected(dev.address) &&
+                currentBle.devicesByAddress[dev.address] == null
+        }
+        if (hasDisconnected) {
+            connectAllSavedDevicesStaggered(saved)
+            scheduleAutoReconnectIfNeeded(aggressiveCarStart = true)
+        }
+    }
+
     fun ensureBackgroundServiceFromForeground() {
         syncForegroundServiceState()
     }
 
-    private fun syncForegroundServiceState() {
-        val saved = _prefs.value
-        val shouldRunService = saved.powerOn &&
-            (saved.syncEnabled || bleState.value.isConnected) &&
-            (saved.isSpotifyLoggedIn || bleState.value.isConnected)
+    private fun syncForegroundServiceState(
+        savedOverride: SavedAppPrefs? = null,
+        forceKeepAliveForAutoConnect: Boolean = false,
+    ) {
+        val saved = savedOverride ?: _prefs.value
+        val hasSavedAutoConnect = saved.autoConnectBle && saved.savedBleDevices.isNotEmpty()
+        val shouldRunService = (saved.powerOn &&
+            (saved.syncEnabled || bleState.value.isConnected || hasSavedAutoConnect) &&
+            (saved.isSpotifyLoggedIn || bleState.value.isConnected || hasSavedAutoConnect)) ||
+            forceKeepAliveForAutoConnect
 
         val intent = Intent(appContext, SymphonySyncService::class.java)
         runCatching {
@@ -352,12 +550,11 @@ class SyncEngine(
     fun togglePower(on: Boolean) {
         scope.launch {
             prefsStore.setPowerOn(on)
-            bleManager.sendPowerAll(on)
+            val saved = _prefs.value.copy(powerOn = on)
             if (on) {
-                delay(180L)
-                val saved = _prefs.value
-                val target = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
-                sendColorWithPrefs(target, saved)
+                restoreSavedConfigurationToControllers(saved)
+            } else {
+                bleManager.sendPowerAll(false)
             }
         }
     }
@@ -411,6 +608,7 @@ class SyncEngine(
     fun setManualColor(argb: Int) {
         scope.launch {
             prefsStore.setManualColorArgb(argb)
+            prefsStore.setManualEffectActive(false)
             if (_prefs.value.syncEnabled) {
                 prefsStore.setSyncEnabled(false)
             }
@@ -428,6 +626,7 @@ class SyncEngine(
         val effect = LedProtocol.symphonyEffects.getOrNull(effectIndex) ?: return
         scope.launch {
             prefsStore.setActiveEffectIndex(effectIndex)
+            prefsStore.setManualEffectActive(true)
             if (_prefs.value.syncEnabled) {
                 prefsStore.setSyncEnabled(false)
             }
@@ -437,6 +636,10 @@ class SyncEngine(
                 delay(160L)
             }
             val speed = _prefs.value.effectSpeed
+            bleManager.sendControlPacketsAll { profile ->
+                LedProtocol.buildSpeedPacket(profile, speed)
+            }
+            delay(95L)
             bleManager.sendControlPacketsAll { profile ->
                 LedProtocol.buildEffectPacket(profile, effect, speed)
             }
@@ -491,7 +694,16 @@ class SyncEngine(
     }
 
     fun setAutoConnectBle(enabled: Boolean) {
-        scope.launch { prefsStore.setAutoConnectBle(enabled) }
+        scope.launch {
+            prefsStore.setAutoConnectBle(enabled)
+            if (enabled) {
+                reconnectSavedDevicesIfNeeded()
+            }
+        }
+    }
+
+    fun setAutoOpenOnCarStart(enabled: Boolean) {
+        scope.launch { prefsStore.setAutoOpenOnCarStart(enabled) }
     }
 
     fun setPollIntervalMs(intervalMs: Long) {

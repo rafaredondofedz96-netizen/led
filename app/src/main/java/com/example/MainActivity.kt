@@ -95,14 +95,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        (application as SymphonyApp).syncEngine.setActivityVisible(true)
+    }
+
     override fun onResume() {
         super.onResume()
-        (application as SymphonyApp).syncEngine.ensureBackgroundServiceFromForeground()
+        val engine = (application as SymphonyApp).syncEngine
+        engine.ensureBackgroundServiceFromForeground()
+        engine.reconnectSavedDevicesIfNeeded()
     }
 
     override fun onPause() {
         (application as SymphonyApp).syncEngine.ensureBackgroundServiceFromForeground()
         super.onPause()
+    }
+
+    override fun onStop() {
+        (application as SymphonyApp).syncEngine.setActivityVisible(false)
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -316,6 +328,7 @@ private fun ActiveTabContent(
             onSelectColorOrder = viewModel::setColorOrder,
             onTogglePureCalibration = viewModel::setPureLedCalibration,
             onToggleAutoConnect = viewModel::setAutoConnectBle,
+            onToggleAutoOpenOnCarStart = viewModel::setAutoOpenOnCarStart,
         )
 
         AppTab.ACCOUNT -> SpotifyAccountScreen(
@@ -326,6 +339,7 @@ private fun ActiveTabContent(
             onSelectPollInterval = viewModel::setPollIntervalMs,
             onLogout = viewModel::logoutSpotify,
             onCheckGithubUpdates = viewModel::checkForGithubUpdates,
+            onToggleAutoOpenOnCarStart = viewModel::setAutoOpenOnCarStart,
         )
     }
 }

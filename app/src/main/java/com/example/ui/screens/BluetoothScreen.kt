@@ -75,6 +75,7 @@ fun BluetoothScreen(
     onSelectColorOrder: (ColorOrder) -> Unit,
     onTogglePureCalibration: (Boolean) -> Unit,
     onToggleAutoConnect: (Boolean) -> Unit,
+    onToggleAutoOpenOnCarStart: (Boolean) -> Unit,
 ) {
     val ble = state.ble
     if (isWidescreen) {
@@ -97,6 +98,7 @@ fun BluetoothScreen(
                     onDisconnectDevice = onDisconnectDevice,
                     onDisconnectAll = onDisconnectAll,
                     onToggleAutoConnect = onToggleAutoConnect,
+                    onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
                 )
                 ColorCalibrationCard(
                     colorOrder = state.prefs.colorOrder,
@@ -136,6 +138,7 @@ fun BluetoothScreen(
                 onDisconnectDevice = onDisconnectDevice,
                 onDisconnectAll = onDisconnectAll,
                 onToggleAutoConnect = onToggleAutoConnect,
+                onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
             )
             DiscoveredDevicesCard(
                 devices = ble.discoveredDevices,
@@ -168,6 +171,7 @@ private fun ConnectionStatusCard(
     onDisconnectDevice: (String) -> Unit,
     onDisconnectAll: () -> Unit,
     onToggleAutoConnect: (Boolean) -> Unit,
+    onToggleAutoOpenOnCarStart: (Boolean) -> Unit,
 ) {
     val ble = state.ble
     val activeNodes = ble.devicesByAddress.values.toList()
@@ -312,13 +316,37 @@ private fun ConnectionStatusCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Auto-conectar todos al abrir",
+                    text = "Auto-conectar ambos al abrir",
                     style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.weight(1f),
                 )
                 Switch(
                     checked = state.prefs.autoConnectBle,
                     onCheckedChange = onToggleAutoConnect,
                     modifier = Modifier.testTag("ble_autoconnect_switch"),
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Abrir y conectar al arrancar el coche",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        text = "Recupera el último modo, brillo y color guardados",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary,
+                    )
+                }
+                Switch(
+                    checked = state.prefs.autoOpenOnCarStart,
+                    onCheckedChange = onToggleAutoOpenOnCarStart,
+                    modifier = Modifier.testTag("ble_autoopen_switch"),
                 )
             }
 
