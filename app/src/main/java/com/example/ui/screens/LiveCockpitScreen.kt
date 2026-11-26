@@ -87,6 +87,8 @@ fun LiveCockpitScreen(
     onToggleSync: (Boolean) -> Unit,
     onSelectSyncStyle: (CoverSyncStyle) -> Unit,
     onBrightnessChange: (Int) -> Unit,
+    onTransitionSpeedChange: (Int) -> Unit,
+    onPulseMinChange: (Int) -> Unit,
     onManualColor: (Int) -> Unit,
     onNavigateTab: (AppTab) -> Unit,
 ) {
@@ -119,6 +121,8 @@ fun LiveCockpitScreen(
                 onToggleSync = onToggleSync,
                 onSelectSyncStyle = onSelectSyncStyle,
                 onBrightnessChange = onBrightnessChange,
+                onTransitionSpeedChange = onTransitionSpeedChange,
+                onPulseMinChange = onPulseMinChange,
                 onManualColor = onManualColor,
                 onNavigateTab = onNavigateTab,
                 modifier = Modifier
@@ -147,6 +151,8 @@ fun LiveCockpitScreen(
                 onToggleSync = onToggleSync,
                 onSelectSyncStyle = onSelectSyncStyle,
                 onBrightnessChange = onBrightnessChange,
+                onTransitionSpeedChange = onTransitionSpeedChange,
+                onPulseMinChange = onPulseMinChange,
                 onManualColor = onManualColor,
                 onNavigateTab = onNavigateTab,
             )
@@ -406,6 +412,8 @@ private fun ControlConsoleColumn(
     onToggleSync: (Boolean) -> Unit,
     onSelectSyncStyle: (CoverSyncStyle) -> Unit,
     onBrightnessChange: (Int) -> Unit,
+    onTransitionSpeedChange: (Int) -> Unit,
+    onPulseMinChange: (Int) -> Unit,
     onManualColor: (Int) -> Unit,
     onNavigateTab: (AppTab) -> Unit,
     modifier: Modifier = Modifier,
@@ -523,7 +531,7 @@ private fun ControlConsoleColumn(
             }
         }
 
-        // Cover Sync Style Card
+        // Cover Sync Style + Progressive Transition Card
         Surface(
             shape = MaterialTheme.shapes.medium,
             color = CockpitSurface,
@@ -542,7 +550,7 @@ private fun ControlConsoleColumn(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Estilo de Color de Portada",
+                        text = "Estilos y Transición de Portada",
                         style = MaterialTheme.typography.titleMedium,
                     )
                 }
@@ -557,10 +565,64 @@ private fun ControlConsoleColumn(
                             onClick = { onSelectSyncStyle(style) },
                             label = { Text(style.label) },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = liveColor.copy(alpha = 0.2f),
+                                selectedContainerColor = liveColor.copy(alpha = 0.22f),
                                 selectedLabelColor = MaterialTheme.colorScheme.onSurface,
                             ),
                             modifier = Modifier.testTag("sync_style_${style.id}"),
+                        )
+                    }
+                }
+                Text(
+                    text = state.prefs.coverSyncStyle.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+
+                // Progressive Transition / Breathing Speed
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text("Suavidad / Velocidad Transición", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = when {
+                                state.prefs.transitionSpeed <= 28 -> "Muy Suave"
+                                state.prefs.transitionSpeed <= 65 -> "Progresivo (${state.prefs.transitionSpeed}%)"
+                                else -> "Dinámico (${state.prefs.transitionSpeed}%)"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = liveColor,
+                        )
+                    }
+                    Slider(
+                        value = state.prefs.transitionSpeed.toFloat(),
+                        onValueChange = { onTransitionSpeedChange(it.toInt()) },
+                        valueRange = 5f..100f,
+                        colors = SliderDefaults.colors(thumbColor = liveColor, activeTrackColor = liveColor),
+                        modifier = Modifier.testTag("live_transition_slider"),
+                    )
+                }
+
+                if (state.prefs.coverSyncStyle != CoverSyncStyle.SOLID_PRIMARY) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text("Intensidad Mínima en Pulso", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                text = "${state.prefs.pulseMinBrightness}%",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = liveColor,
+                            )
+                        }
+                        Slider(
+                            value = state.prefs.pulseMinBrightness.toFloat(),
+                            onValueChange = { onPulseMinChange(it.toInt()) },
+                            valueRange = 15f..85f,
+                            colors = SliderDefaults.colors(thumbColor = liveColor, activeTrackColor = liveColor),
+                            modifier = Modifier.testTag("live_pulse_min_slider"),
                         )
                     }
                 }

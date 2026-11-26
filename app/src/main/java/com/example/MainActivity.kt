@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -145,10 +146,32 @@ private fun SymphonyCockpitShell(
     }
 
     val blePermissions = rememberBlePermissions()
+    val enableBluetoothLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { _ ->
+        viewModel.refreshBluetoothState()
+        if (state.ble.isBluetoothEnabled) {
+            (context.applicationContext as? SymphonyApp)?.syncEngine?.reconnectSavedDevicesIfNeeded()
+        }
+    }
+
+    val ensureBluetoothOn = {
+        viewModel.refreshBluetoothState()
+        if (!state.ble.isBluetoothEnabled) {
+            val silentlyRequested = viewModel.tryAutoEnableBluetooth()
+            if (!silentlyRequested && viewModel.hasBleConnectPermission()) {
+                runCatching {
+                    enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                }
+            }
+        }
+    }
+
     val blePermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         if (results.values.all { it }) {
+            ensureBluetoothOn()
             viewModel.startBleScan()
         }
     }
@@ -159,6 +182,9 @@ private fun SymphonyCockpitShell(
 
     LaunchedEffect(Unit) {
         viewModel.refreshBluetoothState()
+        if (state.prefs.autoEnableBluetooth && !state.ble.isBluetoothEnabled) {
+            ensureBluetoothOn()
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
                 context,
@@ -172,6 +198,7 @@ private fun SymphonyCockpitShell(
 
     val requestBleScanWithPermissions = {
         if (viewModel.hasBleScanPermission()) {
+            ensureBluetoothOn()
             viewModel.startBleScan()
         } else {
             blePermissionLauncher.launch(blePermissions)
@@ -180,6 +207,7 @@ private fun SymphonyCockpitShell(
 
     val connectBleWithPermissions: (String, String) -> Unit = { addr, name ->
         if (viewModel.hasBleConnectPermission()) {
+            ensureBluetoothOn()
             viewModel.connectBleDevice(addr, name)
         } else {
             blePermissionLauncher.launch(blePermissions)
@@ -233,6 +261,7 @@ private fun SymphonyCockpitShell(
                         onNavigateTab = { selectedTab = it },
                         onRequestScan = requestBleScanWithPermissions,
                         onConnectDevice = connectBleWithPermissions,
+                        onEnableBluetoothNow = ensureBluetoothOn,
                     )
                 }
             }
@@ -278,6 +307,7 @@ private fun SymphonyCockpitShell(
                         onNavigateTab = { selectedTab = it },
                         onRequestScan = requestBleScanWithPermissions,
                         onConnectDevice = connectBleWithPermissions,
+                        onEnableBluetoothNow = ensureBluetoothOn,
                     )
                 }
             }
@@ -294,6 +324,7 @@ private fun ActiveTabContent(
     onNavigateTab: (AppTab) -> Unit,
     onRequestScan: () -> Unit,
     onConnectDevice: (String, String) -> Unit,
+    onEnableBluetoothNow: () -> Unit,
 ) {
     when (selectedTab) {
         AppTab.LIVE -> LiveCockpitScreen(
@@ -303,6 +334,8 @@ private fun ActiveTabContent(
             onToggleSync = viewModel::setSyncEnabled,
             onSelectSyncStyle = viewModel::setCoverSyncStyle,
             onBrightnessChange = viewModel::setBrightness,
+            onTransitionSpeedChange = viewModel::setTransitionSpeed,
+            onPulseMinChange = viewModel::setPulseMinBrightness,
             onManualColor = viewModel::setManualColor,
             onNavigateTab = onNavigateTab,
         )
@@ -324,11 +357,16 @@ private fun ActiveTabContent(
             onConnectDevice = onConnectDevice,
             onDisconnectDevice = viewModel::disconnectBleDevice,
             onDisconnectAll = viewModel::disconnectAllBle,
+            onTestDevice = viewModel::testBleDevice,
             onSelectProtocol = viewModel::setProtocolProfile,
+            onSelectDeviceProtocol = viewModel::setDeviceProtocol,
             onSelectColorOrder = viewModel::setColorOrder,
+            onSelectDeviceColorOrder = viewModel::setDeviceColorOrder,
             onTogglePureCalibration = viewModel::setPureLedCalibration,
             onToggleAutoConnect = viewModel::setAutoConnectBle,
             onToggleAutoOpenOnCarStart = viewModel::setAutoOpenOnCarStart,
+            onToggleAutoEnableBluetooth = viewModel::setAutoEnableBluetooth,
+            onEnableBluetoothNow = onEnableBluetoothNow,
         )
 
         AppTab.ACCOUNT -> SpotifyAccountScreen(

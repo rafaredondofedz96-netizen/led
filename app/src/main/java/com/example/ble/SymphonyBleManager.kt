@@ -51,6 +51,7 @@ data class ConnectedDeviceInfo(
     val status: BleConnectionStatus,
     val activeCharUuid: String? = null,
     val detectedProfile: ProtocolProfile = ProtocolProfile.LEDCAR_01,
+    val lastTxHex: String? = null,
 )
 
 data class BleUiState(
@@ -115,6 +116,7 @@ class SymphonyBleManager(private val context: Context) {
         var status: BleConnectionStatus = BleConnectionStatus.CONNECTING,
         var detectedProfile: ProtocolProfile = ProtocolProfile.LEDCAR_01,
         var activeCharUuid: String? = null,
+        var lastTxHex: String? = null,
         var lastColorPacket: ByteArray? = null,
         val controlChannel: Channel<ByteArray> = Channel(capacity = 12),
         val colorChannel: Channel<ByteArray> = Channel(capacity = Channel.CONFLATED),
@@ -124,6 +126,8 @@ class SymphonyBleManager(private val context: Context) {
 
     private val nodes = ConcurrentHashMap<String, BleNode>()
     private val manuallyDisconnectedAddresses = ConcurrentHashMap.newKeySet<String>()
+    private val deviceProfileOverrides = ConcurrentHashMap<String, ProtocolProfile>()
+    private val deviceColorOrderOverrides = ConcurrentHashMap<String, ColorOrder>()
 
     private var scanJob: Job? = null
 
@@ -203,14 +207,61 @@ class SymphonyBleManager(private val context: Context) {
         }
     }
 
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    fun tryAutoEnableBluetooth(): Boolean {
+        val bt = adapter ?: return false
+        if (bt.isEnabled) {
+            refreshAdapterState()
+            return true
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            val canTry = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                hasBleConnectPermission()
+            } else {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADMIN) ==
+                    PackageManager.PERMISSION_GRANTED
+            }
+            if (canTry) {
+                val requested = runCatching { bt.enable() }.getOrDefault(false)
+                if (requested) {
+                    _state.update {
+                        it.copy(statusMessage = "Activando Bluetooth automáticamente…")
+                    }
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     fun setSelectedProfile(profile: ProtocolProfile) {
         _state.update { it.copy(selectedProfile = profile) }
     }
 
-    private fun effectiveProfileFor(node: BleNode): ProtocolProfile {
-        val selected = _state.value.selectedProfile
-        return if (selected == ProtocolProfile.AUTO) node.detectedProfile else selected
+    fun setDeviceOverrides(
+        profiles: Map<String, ProtocolProfile>,
+        colorOrders: Map<String, ColorOrder>,
+    ) {
+        deviceProfileOverrides.clear()
+        deviceProfileOverrides.putAll(profiles)
+        deviceColorOrderOverrides.clear()
+        deviceColorOrderOverrides.putAll(colorOrders)
+        nodes.values.forEach { it.lastColorPacket = null }
     }
+
+    fun effectiveProfileForAddress(address: String, detected: ProtocolProfile): ProtocolProfile {
+        val perDevice = deviceProfileOverrides[address]
+        if (perDevice != null && perDevice != ProtocolProfile.AUTO) return perDevice
+        val globalSelected = _state.value.selectedProfile
+        return if (globalSelected == ProtocolProfile.AUTO) detected else globalSelected
+    }
+
+    private fun effectiveProfileFor(node: BleNode): ProtocolProfile =
+        effectiveProfileForAddress(node.address, node.detectedProfile)
+
+    private fun effectiveColorOrderFor(node: BleNode, defaultOrder: ColorOrder): ColorOrder =
+        deviceColorOrderOverrides[node.address] ?: defaultOrder
 
     fun effectiveProfile(): ProtocolProfile {
         val selected = _state.value.selectedProfile
@@ -397,6 +448,21 @@ class SymphonyBleManager(private val context: Context) {
         }
     }
 
+    /**
+     * Connects to a controller and waits briefly until GATT service discovery finishes
+     * (or fails) so dual TS10 connections don't collide on Realtek/Unisoc BLE chips.
+     */
+    suspend fun connectSequential(address: String, displayName: String? = null, maxWaitMs: Long = 3500L) {
+        connect(address, displayName)
+        val deadline = SystemClock.elapsedRealtime() + maxWaitMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val st = nodes[address]?.status
+            if (st == null || st == BleConnectionStatus.CONNECTED) break
+            delay(120L)
+        }
+        delay(300L)
+    }
+
     private fun publishNodesState(errorMsg: String? = null) {
         val snapshot = nodes.values.associate { n ->
             n.address to ConnectedDeviceInfo(
@@ -405,6 +471,7 @@ class SymphonyBleManager(private val context: Context) {
                 status = n.status,
                 activeCharUuid = n.activeCharUuid,
                 detectedProfile = n.detectedProfile,
+                lastTxHex = n.lastTxHex,
             )
         }
         _state.update {
@@ -529,21 +596,69 @@ class SymphonyBleManager(private val context: Context) {
         colorOrder: ColorOrder,
         pureLedCalibration: Boolean,
     ) {
-        nodes.values.forEach { node ->
-            if (node.status == BleConnectionStatus.CONNECTED) {
-                val packet = LedProtocol.buildColorPacket(
-                    profile = effectiveProfileFor(node),
-                    argb = argb,
-                    brightnessPercent = brightnessPercent,
-                    colorOrder = colorOrder,
-                    pureLedCalibration = pureLedCalibration,
-                )
-                val prev = node.lastColorPacket
-                if (prev != null && prev.contentEquals(packet)) return@forEach
-                node.lastColorPacket = packet
-                node.colorChannel.trySend(packet)
+        sendLiveColors(
+            primaryArgb = argb,
+            secondaryArgb = argb,
+            dualZoneSplit = false,
+            brightnessPercent = brightnessPercent,
+            defaultColorOrder = colorOrder,
+            pureLedCalibration = pureLedCalibration,
+        )
+    }
+
+    fun sendLiveColors(
+        primaryArgb: Int,
+        secondaryArgb: Int,
+        dualZoneSplit: Boolean,
+        brightnessPercent: Int,
+        defaultColorOrder: ColorOrder,
+        pureLedCalibration: Boolean,
+    ) {
+        val connectedNodes = nodes.values
+            .filter { it.status == BleConnectionStatus.CONNECTED }
+            .sortedBy { it.address }
+
+        connectedNodes.forEachIndexed { idx, node ->
+            val zoneArgb = if (dualZoneSplit && connectedNodes.size > 1 && idx % 2 == 1) {
+                secondaryArgb
+            } else {
+                primaryArgb
             }
+            val packet = LedProtocol.buildColorPacket(
+                profile = effectiveProfileFor(node),
+                argb = zoneArgb,
+                brightnessPercent = brightnessPercent,
+                colorOrder = effectiveColorOrderFor(node, defaultColorOrder),
+                pureLedCalibration = pureLedCalibration,
+            )
+            val prev = node.lastColorPacket
+            if (prev != null && prev.contentEquals(packet)) return@forEachIndexed
+            node.lastColorPacket = packet
+            node.colorChannel.trySend(packet)
         }
+    }
+
+    fun sendTestFlashToDevice(
+        address: String,
+        defaultColorOrder: ColorOrder,
+        pureLedCalibration: Boolean,
+    ) {
+        val node = nodes[address] ?: return
+        if (node.status != BleConnectionStatus.CONNECTED) return
+        val profile = effectiveProfileFor(node)
+        val order = effectiveColorOrderFor(node, defaultColorOrder)
+        node.lastColorPacket = null
+        LedProtocol.buildPowerPackets(profile, true).forEach { node.controlChannel.trySend(it) }
+        LedProtocol.buildBrightnessPacket(profile, 100)?.let { node.controlChannel.trySend(it) }
+        node.controlChannel.trySend(
+            LedProtocol.buildColorPacket(
+                profile = profile,
+                argb = 0xFF00E5FF.toInt(),
+                brightnessPercent = 100,
+                colorOrder = order,
+                pureLedCalibration = pureLedCalibration,
+            )
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -575,10 +690,16 @@ class SymphonyBleManager(private val context: Context) {
         }.getOrDefault(false)
 
         if (ok) {
+            val hex = LedProtocol.toHexString(bytes)
+            node.lastTxHex = hex
             val elapsed = (SystemClock.elapsedRealtime() - start).coerceAtLeast(1L)
-            _state.update {
-                it.copy(
-                    lastTxHex = LedProtocol.toHexString(bytes),
+            _state.update { state ->
+                val updatedMap = state.devicesByAddress[node.address]?.let { existing ->
+                    state.devicesByAddress + (node.address to existing.copy(lastTxHex = hex))
+                } ?: state.devicesByAddress
+                state.copy(
+                    devicesByAddress = updatedMap,
+                    lastTxHex = hex,
                     lastWriteLatencyMs = elapsed,
                 )
             }

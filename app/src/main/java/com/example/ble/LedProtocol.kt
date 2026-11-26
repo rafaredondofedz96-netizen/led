@@ -64,15 +64,18 @@ object LedProtocol {
     fun detectProfile(deviceName: String?, characteristicUuid: String?): ProtocolProfile {
         val name = deviceName?.uppercase().orEmpty()
         val uuid = characteristicUuid?.lowercase().orEmpty()
+        // Check characteristic UUID first so dual modules with the same BLE name
+        // but different GATT chips (e.g. 0xFFF3 ELK vs 0xFFE1 LEDCAR-01) auto-detect accurately.
         return when {
+            uuid.contains("0000fff3") || uuid.contains("0000fff1") -> ProtocolProfile.ELK_LED_LAMP
+            uuid.contains("0000ee01") || uuid.contains("0000ae01") -> ProtocolProfile.BJ_LED
+            uuid.contains("0000ffd9") || uuid.contains("0000ffe9") -> ProtocolProfile.TRIONES
+            uuid.contains("0000ffe1") -> ProtocolProfile.LEDCAR_01
             name.contains("LEDCAR") || name.contains("LEDDMX") || name.contains("VGETTING") ->
                 ProtocolProfile.LEDCAR_01
-            name.contains("BJ_LED") || name.contains("MOHUAN") ||
-                uuid.contains("0000ee01") || uuid.contains("0000ae01") -> ProtocolProfile.BJ_LED
+            name.contains("BJ_LED") || name.contains("MOHUAN") -> ProtocolProfile.BJ_LED
             name.contains("SP110") || name.contains("SP105") -> ProtocolProfile.SP110E
-            name.contains("TRIONES") || name.contains("QHM") ||
-                uuid.contains("0000ffd9") || uuid.contains("0000ffe9") -> ProtocolProfile.TRIONES
-            uuid.contains("0000ffe1") -> ProtocolProfile.LEDCAR_01
+            name.contains("TRIONES") || name.contains("QHM") -> ProtocolProfile.TRIONES
             else -> ProtocolProfile.ELK_LED_LAMP
         }
     }
@@ -163,10 +166,14 @@ object LedProtocol {
     private fun calibrateChannel(channel: Int, maxChannel: Int): Int {
         if (channel == 0) return 0
         val ratio = channel.toFloat() / maxChannel.toFloat()
-        // Suppress bleed below 22% of dominant channel so reds don't shift pink/orange
-        if (ratio < 0.22f) return 0
+        // Smooth soft-knee suppression: eliminates stray <11% bleed on pure red/green
+        // while ramping gradually from 11%..26% so live color fades never flash or step.
+        if (ratio < 0.11f) return 0
+        val kneeFactor = if (ratio < 0.26f) {
+            ((ratio - 0.11f) / 0.15f).coerceIn(0f, 1f)
+        } else 1f
         val normalized = channel / 255.0
-        val gammaCorrected = normalized.pow(1.65)
+        val gammaCorrected = normalized.pow(1.55) * kneeFactor
         return (gammaCorrected * 255.0).roundToInt().coerceIn(0, 255)
     }
 

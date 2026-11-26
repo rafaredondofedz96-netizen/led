@@ -3,6 +3,7 @@ package com.example.core
 import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
@@ -38,6 +39,8 @@ import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sign
 
 data class LivePlaybackState(
     val track: SpotifyTrack? = null,
@@ -94,6 +97,7 @@ class SyncEngine(
             prefsStore.prefsFlow.collectLatest { saved ->
                 _prefs.value = saved
                 bleManager.setSelectedProfile(ProtocolProfile.fromId(saved.protocolId))
+                bleManager.setDeviceOverrides(saved.deviceProfiles, saved.deviceColorOrders)
 
                 if (!initialColorRestored) {
                     initialColorRestored = true
@@ -105,6 +109,10 @@ class SyncEngine(
                         }
                         _playback.update { it.copy(liveLedArgb = restoredArgb) }
                     }
+                }
+
+                if (saved.autoEnableBluetooth && !bleState.value.isBluetoothEnabled) {
+                    bleManager.tryAutoEnableBluetooth()
                 }
 
                 if (!autoConnectAttempted &&
@@ -188,12 +196,16 @@ class SyncEngine(
     private fun connectAllSavedDevicesStaggered(saved: SavedAppPrefs = _prefs.value) {
         scope.launch {
             bleManager.refreshAdapterState()
+            if (!bleState.value.isBluetoothEnabled && saved.autoEnableBluetooth) {
+                bleManager.tryAutoEnableBluetooth()
+                delay(900L)
+                bleManager.refreshAdapterState()
+            }
             if (!bleState.value.isBluetoothEnabled || !bleManager.hasBleConnectPermission()) return@launch
             val devices = saved.savedBleDevices
-            devices.forEachIndexed { idx, dev ->
+            devices.forEach { dev ->
                 if (!bleManager.isManuallyDisconnected(dev.address)) {
-                    if (idx > 0) delay(250L) // Stagger dual GATT connect so TS10 BLE doesn't collide
-                    bleManager.connect(dev.address, dev.name)
+                    bleManager.connectSequential(dev.address, dev.name)
                 }
             }
         }
@@ -228,7 +240,12 @@ class SyncEngine(
                 val currentSaved = _prefs.value
                 if (!currentSaved.autoConnectBle || !bleManager.hasBleConnectPermission()) break
                 bleManager.refreshAdapterState()
-                if (!bleState.value.isBluetoothEnabled) continue
+                if (!bleState.value.isBluetoothEnabled) {
+                    if (currentSaved.autoEnableBluetooth) {
+                        bleManager.tryAutoEnableBluetooth()
+                    }
+                    continue
+                }
 
                 val currentBle = bleState.value
                 val pending = currentSaved.savedBleDevices.filter { dev ->
@@ -237,9 +254,8 @@ class SyncEngine(
                 }
                 if (pending.isEmpty()) break
 
-                pending.forEachIndexed { i, dev ->
-                    if (i > 0) delay(250L)
-                    bleManager.connect(dev.address, dev.name)
+                pending.forEach { dev ->
+                    bleManager.connectSequential(dev.address, dev.name)
                 }
             }
         }
@@ -254,21 +270,12 @@ class SyncEngine(
             pollJob = null
         }
 
-        val shouldAnimateCover = saved.syncEnabled &&
-            saved.powerOn &&
-            saved.coverSyncStyle == CoverSyncStyle.DUAL_BREATHING
-        if (shouldAnimateCover && animationJob?.isActive != true) {
+        val shouldRunSmoothSync = saved.syncEnabled && saved.powerOn
+        if (shouldRunSmoothSync && animationJob?.isActive != true) {
             startCoverAnimationLoop()
-        } else if (!shouldAnimateCover) {
+        } else if (!shouldRunSmoothSync) {
             animationJob?.cancel()
             animationJob = null
-            if (saved.syncEnabled) {
-                val primary = _playback.value.palette.primaryArgb
-                _playback.update { it.copy(liveLedArgb = primary) }
-                if (saved.powerOn) {
-                    sendColorWithPrefs(primary, saved)
-                }
-            }
         }
 
         syncForegroundServiceState()
@@ -307,19 +314,13 @@ class SyncEngine(
                             }
                         }
 
+                        // Only update track & target palette; smooth loop glides progressively without snaps or flashes
                         _playback.update {
                             it.copy(
                                 track = track,
                                 palette = updatedPalette,
-                                liveLedArgb = if (isNewTrack || _prefs.value.coverSyncStyle == CoverSyncStyle.SOLID_PRIMARY) {
-                                    updatedPalette.primaryArgb
-                                } else it.liveLedArgb,
                                 spotifyStatusMessage = if (track.isPlaying) null else "En pausa en Spotify",
                             )
-                        }
-
-                        if (isNewTrack && saved.powerOn && saved.syncEnabled) {
-                            sendColorWithPrefs(updatedPalette.primaryArgb, saved)
                         }
 
                         delay(saved.pollIntervalMs)
@@ -353,38 +354,148 @@ class SyncEngine(
         }
     }
 
+    /**
+     * Unified smooth transition + progressive intensity engine (~8.7 Hz, 115ms pacing).
+     * Eliminates abrupt color jumps and flashes on song changes or breathing transitions.
+     */
     private fun startCoverAnimationLoop() {
         animationJob?.cancel()
         animationJob = scope.launch {
             var phase = 0f
-            var lastDispatchedArgb = 0
+            var smoothedPrimary = _playback.value.liveLedArgb
+            var smoothedSecondary = _playback.value.palette.secondaryArgb
+            var lastSentPrimary = 0
+            var lastSentSecondary = 0
+            var lastSentBrightness = -1f
+            var lastSentDualZones = false
+
             while (isActive) {
                 val saved = _prefs.value
-                if (!saved.syncEnabled || !saved.powerOn || saved.coverSyncStyle != CoverSyncStyle.DUAL_BREATHING) {
+                if (!saved.syncEnabled || !saved.powerOn) {
                     break
                 }
 
-                val currentTrack = _playback.value.track
                 val pal = _playback.value.palette
-                val targetArgb = if (currentTrack?.isPlaying == false || pal.primaryArgb == pal.secondaryArgb) {
-                    pal.primaryArgb
-                } else {
-                    val t = ((1.0 - cos(phase * 2.0 * PI)) * 0.5).toFloat()
-                    AlbumPaletteExtractor.lerpRgb(pal.primaryArgb, pal.secondaryArgb, t)
+                val hasTrack = _playback.value.track != null
+                val targetPrimary = if (hasTrack) pal.primaryArgb else saved.lastLiveLedArgb
+                val targetSecondary = if (hasTrack) pal.secondaryArgb else pal.secondaryArgb
+
+                // Progressive easing factor controlled by saved.transitionSpeed (5..100)
+                val easeFraction = 0.055f + (saved.transitionSpeed / 100f) * 0.24f
+                smoothedPrimary = easeRgbSmooth(smoothedPrimary, targetPrimary, easeFraction)
+                smoothedSecondary = easeRgbSmooth(smoothedSecondary, targetSecondary, easeFraction)
+
+                val waveT = ((1.0 - cos(phase * 2.0 * PI)) * 0.5).toFloat()
+                val minFloor = (saved.pulseMinBrightness / 100f).coerceIn(0.15f, 0.85f)
+                val maxBrightness = saved.brightness.toFloat()
+                val isPlaying = _playback.value.track?.isPlaying != false
+
+                var outPrimary = smoothedPrimary
+                var outSecondary = smoothedPrimary
+                var dualSplit = false
+                var outBrightness = maxBrightness
+
+                when (saved.coverSyncStyle) {
+                    CoverSyncStyle.PRIMARY_BREATHING -> {
+                        outPrimary = smoothedPrimary
+                        val depth = if (isPlaying) waveT else 0.75f
+                        outBrightness = maxBrightness * (minFloor + (1f - minFloor) * depth)
+                    }
+
+                    CoverSyncStyle.SOLID_PRIMARY -> {
+                        outPrimary = smoothedPrimary
+                        outBrightness = maxBrightness
+                    }
+
+                    CoverSyncStyle.DUAL_BREATHING -> {
+                        val blend = if (smoothedPrimary == smoothedSecondary) {
+                            smoothedPrimary
+                        } else {
+                            AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedSecondary, waveT)
+                        }
+                        outPrimary = blend
+                        // Subtle gentle intensity lift without dipping dark
+                        val softFloor = minFloor.coerceAtLeast(0.65f)
+                        outBrightness = maxBrightness * (softFloor + (1f - softFloor) * waveT)
+                    }
+
+                    CoverSyncStyle.DUAL_ZONES -> {
+                        dualSplit = true
+                        outPrimary = smoothedPrimary
+                        outSecondary = smoothedSecondary
+                        val depth = if (isPlaying) waveT else 0.8f
+                        outBrightness = maxBrightness * (minFloor + (1f - minFloor) * depth)
+                    }
+
+                    CoverSyncStyle.SPECTRUM_DRIFT -> {
+                        val driftDeg = ((waveT - 0.5f) * 34f)
+                        outPrimary = shiftHueGentle(smoothedPrimary, driftDeg)
+                        val depth = if (isPlaying) waveT else 0.8f
+                        outBrightness = maxBrightness * (minFloor + (1f - minFloor) * depth)
+                    }
                 }
 
-                _playback.update { it.copy(liveLedArgb = targetArgb) }
-                if (bleState.value.isConnected && colorDelta(targetArgb, lastDispatchedArgb) >= 10) {
-                    lastDispatchedArgb = targetArgb
-                    sendColorWithPrefs(targetArgb, saved)
+                _playback.update { it.copy(liveLedArgb = outPrimary) }
+
+                val shouldDispatch = bleState.value.isConnected && (
+                    lastSentDualZones != dualSplit ||
+                        colorDelta(outPrimary, lastSentPrimary) >= 2 ||
+                        (dualSplit && colorDelta(outSecondary, lastSentSecondary) >= 2) ||
+                        abs(outBrightness - lastSentBrightness) >= 1.5f
+                    )
+
+                if (shouldDispatch) {
+                    lastSentPrimary = outPrimary
+                    lastSentSecondary = outSecondary
+                    lastSentBrightness = outBrightness
+                    lastSentDualZones = dualSplit
+                    bleManager.sendLiveColors(
+                        primaryArgb = outPrimary,
+                        secondaryArgb = outSecondary,
+                        dualZoneSplit = dualSplit,
+                        brightnessPercent = outBrightness.roundToInt().coerceIn(5, 100),
+                        defaultColorOrder = saved.colorOrder,
+                        pureLedCalibration = saved.pureLedCalibration,
+                    )
                 }
 
-                val speedFactor = 0.012f + (saved.effectSpeed / 100f) * 0.032f
-                phase = (phase + speedFactor) % 1f
-                // Safe 140ms pacing keeps dual LEDCAR-01 controllers smooth and crash-free
-                delay(140L)
+                // Gentle progressive breathing rate
+                val phaseStep = 0.008f + (saved.transitionSpeed / 100f) * 0.026f
+                phase = (phase + phaseStep) % 1f
+                delay(115L)
             }
         }
+    }
+
+    private fun easeRgbSmooth(current: Int, target: Int, fraction: Float): Int {
+        if (current == target) return target
+        val cr = (current shr 16) and 0xFF
+        val cg = (current shr 8) and 0xFF
+        val cb = current and 0xFF
+        val tr = (target shr 16) and 0xFF
+        val tg = (target shr 8) and 0xFF
+        val tb = target and 0xFF
+
+        fun stepChannel(c: Int, t: Int): Int {
+            val diff = t - c
+            if (diff == 0) return c
+            val step = (diff * fraction).roundToInt()
+            val moved = if (step == 0) diff.sign else step
+            return (c + moved).coerceIn(0, 255)
+        }
+
+        return AndroidColor.rgb(
+            stepChannel(cr, tr),
+            stepChannel(cg, tg),
+            stepChannel(cb, tb),
+        )
+    }
+
+    private fun shiftHueGentle(argb: Int, deltaDeg: Float): Int {
+        val hsv = FloatArray(3)
+        AndroidColor.colorToHSV(argb, hsv)
+        hsv[0] = ((hsv[0] + deltaDeg) % 360f + 360f) % 360f
+        return AndroidColor.HSVToColor(hsv)
     }
 
     private fun colorDelta(a: Int, b: Int): Int {
@@ -444,7 +555,14 @@ class SyncEngine(
                 val saved = prefsStore.getSnapshot()
                 _prefs.value = saved
                 bleManager.setSelectedProfile(ProtocolProfile.fromId(saved.protocolId))
+                bleManager.setDeviceOverrides(saved.deviceProfiles, saved.deviceColorOrders)
                 bleManager.refreshAdapterState()
+
+                if (saved.autoEnableBluetooth && !bleState.value.isBluetoothEnabled) {
+                    bleManager.tryAutoEnableBluetooth()
+                    delay(800L)
+                    bleManager.refreshAdapterState()
+                }
 
                 if (_playback.value.track == null) {
                     val restoredArgb = if (saved.syncEnabled) saved.lastLiveLedArgb else saved.manualColorArgb
@@ -704,6 +822,67 @@ class SyncEngine(
 
     fun setAutoOpenOnCarStart(enabled: Boolean) {
         scope.launch { prefsStore.setAutoOpenOnCarStart(enabled) }
+    }
+
+    fun setAutoEnableBluetooth(enabled: Boolean) {
+        scope.launch {
+            prefsStore.setAutoEnableBluetooth(enabled)
+            if (enabled) {
+                bleManager.tryAutoEnableBluetooth()
+            }
+        }
+    }
+
+    fun setTransitionSpeed(speed: Int) {
+        scope.launch { prefsStore.setTransitionSpeed(speed) }
+    }
+
+    fun setPulseMinBrightness(minPercent: Int) {
+        scope.launch { prefsStore.setPulseMinBrightness(minPercent) }
+    }
+
+    fun setDeviceProtocol(address: String, profile: ProtocolProfile) {
+        scope.launch {
+            prefsStore.setDeviceProtocol(address, profile)
+            val saved = _prefs.value
+            val updatedMap = saved.deviceProfiles.toMutableMap().apply {
+                if (profile == ProtocolProfile.AUTO) remove(address) else put(address, profile)
+            }
+            bleManager.setDeviceOverrides(updatedMap, saved.deviceColorOrders)
+            if (saved.powerOn) {
+                restoreSavedConfigurationToControllers(saved.copy(deviceProfiles = updatedMap))
+            }
+        }
+    }
+
+    fun setDeviceColorOrder(address: String, order: ColorOrder?) {
+        scope.launch {
+            prefsStore.setDeviceColorOrder(address, order)
+            val saved = _prefs.value
+            val updatedMap = saved.deviceColorOrders.toMutableMap().apply {
+                if (order == null) remove(address) else put(address, order)
+            }
+            bleManager.setDeviceOverrides(saved.deviceProfiles, updatedMap)
+            if (saved.powerOn) {
+                val color = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
+                sendColorWithPrefs(color, saved.copy(deviceColorOrders = updatedMap))
+            }
+        }
+    }
+
+    fun testBleDevice(address: String) {
+        scope.launch {
+            val saved = _prefs.value
+            bleManager.sendTestFlashToDevice(
+                address = address,
+                defaultColorOrder = saved.colorOrder,
+                pureLedCalibration = saved.pureLedCalibration,
+            )
+            delay(1200L)
+            if (saved.powerOn) {
+                restoreSavedConfigurationToControllers(saved)
+            }
+        }
     }
 
     fun setPollIntervalMs(intervalMs: Long) {

@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.ble.ColorOrder
+import com.example.ble.ProtocolProfile
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -19,13 +20,36 @@ private val Context.symphonyDataStore: DataStore<Preferences> by preferencesData
     name = "symphony_prefs"
 )
 
-enum class CoverSyncStyle(val id: String, val label: String) {
-    SOLID_PRIMARY("solid", "Solo Principal"),
-    DUAL_BREATHING("dual", "Pulso 2 Colores");
+enum class CoverSyncStyle(val id: String, val label: String, val description: String) {
+    PRIMARY_BREATHING(
+        "primary_pulse",
+        "Pulso Principal",
+        "Color principal cambiando de intensidad progresivamente",
+    ),
+    SOLID_PRIMARY(
+        "solid",
+        "Principal Fijo",
+        "Color principal estable con transición suave al cambiar canción",
+    ),
+    DUAL_BREATHING(
+        "dual",
+        "Onda 2 Colores",
+        "Fluye progresivamente entre el color principal y secundario",
+    ),
+    DUAL_ZONES(
+        "zones",
+        "Tiras / Pies Dual",
+        "Color principal en un controlador y secundario en el otro",
+    ),
+    SPECTRUM_DRIFT(
+        "drift",
+        "Brisa Neón",
+        "Respira suavemente con matiz armónico sin cambios bruscos",
+    );
 
     companion object {
         fun fromId(id: String?): CoverSyncStyle =
-            entries.firstOrNull { it.id == id } ?: SOLID_PRIMARY
+            entries.firstOrNull { it.id == id } ?: PRIMARY_BREATHING
     }
 }
 
@@ -44,12 +68,16 @@ data class SavedAppPrefs(
     val savedBleDevices: List<SavedBleDevice> = emptyList(),
     val protocolId: String = "AUTO",
     val colorOrder: ColorOrder = ColorOrder.RGB,
+    val deviceProfiles: Map<String, ProtocolProfile> = emptyMap(),
+    val deviceColorOrders: Map<String, ColorOrder> = emptyMap(),
     val pureLedCalibration: Boolean = true,
     val powerOn: Boolean = true,
     val brightness: Int = 85,
     val effectSpeed: Int = 55,
+    val transitionSpeed: Int = 45,
+    val pulseMinBrightness: Int = 35,
     val syncEnabled: Boolean = true,
-    val coverSyncStyle: CoverSyncStyle = CoverSyncStyle.SOLID_PRIMARY,
+    val coverSyncStyle: CoverSyncStyle = CoverSyncStyle.PRIMARY_BREATHING,
     val manualColorArgb: Int = 0xFF00E5FF.toInt(),
     val manualEffectActive: Boolean = false,
     val lastLiveLedArgb: Int = 0xFF00E5FF.toInt(),
@@ -57,6 +85,7 @@ data class SavedAppPrefs(
     val pollIntervalMs: Long = 1200L,
     val autoConnectBle: Boolean = true,
     val autoOpenOnCarStart: Boolean = true,
+    val autoEnableBluetooth: Boolean = true,
     val githubRepo: String = "",
 ) {
     val hasSpotifyCredentials: Boolean
@@ -82,10 +111,14 @@ class PrefsStore(context: Context) {
         val BLE_DEVICES_SET = stringSetPreferencesKey("ble_devices_set")
         val PROTOCOL_ID = stringPreferencesKey("led_protocol_id")
         val COLOR_ORDER = stringPreferencesKey("led_color_order")
+        val DEVICE_PROFILES_SET = stringSetPreferencesKey("device_protocols_set")
+        val DEVICE_COLOR_ORDERS_SET = stringSetPreferencesKey("device_color_orders_set")
         val PURE_LED_CAL = booleanPreferencesKey("led_pure_calibration")
         val POWER_ON = booleanPreferencesKey("led_power_on")
         val BRIGHTNESS = intPreferencesKey("led_brightness")
         val SPEED = intPreferencesKey("led_speed")
+        val TRANSITION_SPEED = intPreferencesKey("transition_speed")
+        val PULSE_MIN_BRIGHTNESS = intPreferencesKey("pulse_min_brightness")
         val SYNC_ENABLED = booleanPreferencesKey("sync_enabled")
         val COVER_SYNC_STYLE = stringPreferencesKey("cover_sync_style")
         val MANUAL_COLOR = intPreferencesKey("manual_color_rgb")
@@ -95,6 +128,7 @@ class PrefsStore(context: Context) {
         val POLL_INTERVAL = longPreferencesKey("poll_interval_ms")
         val AUTO_CONNECT_BLE = booleanPreferencesKey("auto_connect_ble")
         val AUTO_OPEN_ON_CAR_START = booleanPreferencesKey("auto_open_on_car_start")
+        val AUTO_ENABLE_BLUETOOTH = booleanPreferencesKey("auto_enable_bluetooth")
         val GITHUB_REPO = stringPreferencesKey("github_repo")
     }
 
@@ -119,6 +153,18 @@ class PrefsStore(context: Context) {
             }
         }
 
+        val devProfiles = p[Keys.DEVICE_PROFILES_SET].orEmpty().mapNotNull { entry ->
+            val idx = entry.indexOf('|')
+            if (idx <= 0) null
+            else entry.substring(0, idx) to ProtocolProfile.fromId(entry.substring(idx + 1))
+        }.toMap()
+
+        val devColorOrders = p[Keys.DEVICE_COLOR_ORDERS_SET].orEmpty().mapNotNull { entry ->
+            val idx = entry.indexOf('|')
+            if (idx <= 0) null
+            else entry.substring(0, idx) to ColorOrder.fromId(entry.substring(idx + 1))
+        }.toMap()
+
         SavedAppPrefs(
             clientId = p[Keys.CLIENT_ID] ?: "",
             clientSecret = p[Keys.CLIENT_SECRET] ?: "",
@@ -129,10 +175,14 @@ class PrefsStore(context: Context) {
             savedBleDevices = devices,
             protocolId = p[Keys.PROTOCOL_ID] ?: "AUTO",
             colorOrder = ColorOrder.fromId(p[Keys.COLOR_ORDER]),
+            deviceProfiles = devProfiles,
+            deviceColorOrders = devColorOrders,
             pureLedCalibration = p[Keys.PURE_LED_CAL] ?: true,
             powerOn = p[Keys.POWER_ON] ?: true,
             brightness = (p[Keys.BRIGHTNESS] ?: 85).coerceIn(5, 100),
             effectSpeed = (p[Keys.SPEED] ?: 55).coerceIn(5, 100),
+            transitionSpeed = (p[Keys.TRANSITION_SPEED] ?: 45).coerceIn(5, 100),
+            pulseMinBrightness = (p[Keys.PULSE_MIN_BRIGHTNESS] ?: 35).coerceIn(15, 85),
             syncEnabled = p[Keys.SYNC_ENABLED] ?: true,
             coverSyncStyle = CoverSyncStyle.fromId(p[Keys.COVER_SYNC_STYLE]),
             manualColorArgb = p[Keys.MANUAL_COLOR] ?: 0xFF00E5FF.toInt(),
@@ -142,6 +192,7 @@ class PrefsStore(context: Context) {
             pollIntervalMs = (p[Keys.POLL_INTERVAL] ?: 1200L).coerceIn(800L, 5000L),
             autoConnectBle = p[Keys.AUTO_CONNECT_BLE] ?: true,
             autoOpenOnCarStart = p[Keys.AUTO_OPEN_ON_CAR_START] ?: true,
+            autoEnableBluetooth = p[Keys.AUTO_ENABLE_BLUETOOTH] ?: true,
             githubRepo = p[Keys.GITHUB_REPO] ?: "",
         )
     }
@@ -230,6 +281,28 @@ class PrefsStore(context: Context) {
         dataStore.edit { it[Keys.COLOR_ORDER] = order.id }
     }
 
+    suspend fun setDeviceProtocol(address: String, profile: ProtocolProfile) {
+        dataStore.edit { p ->
+            val current = p[Keys.DEVICE_PROFILES_SET]?.toMutableSet() ?: mutableSetOf()
+            current.removeAll { it.startsWith("$address|") }
+            if (profile != ProtocolProfile.AUTO) {
+                current.add("$address|${profile.id}")
+            }
+            p[Keys.DEVICE_PROFILES_SET] = current
+        }
+    }
+
+    suspend fun setDeviceColorOrder(address: String, order: ColorOrder?) {
+        dataStore.edit { p ->
+            val current = p[Keys.DEVICE_COLOR_ORDERS_SET]?.toMutableSet() ?: mutableSetOf()
+            current.removeAll { it.startsWith("$address|") }
+            if (order != null) {
+                current.add("$address|${order.id}")
+            }
+            p[Keys.DEVICE_COLOR_ORDERS_SET] = current
+        }
+    }
+
     suspend fun setPureLedCalibration(enabled: Boolean) {
         dataStore.edit { it[Keys.PURE_LED_CAL] = enabled }
     }
@@ -244,6 +317,14 @@ class PrefsStore(context: Context) {
 
     suspend fun setEffectSpeed(speed: Int) {
         dataStore.edit { it[Keys.SPEED] = speed.coerceIn(5, 100) }
+    }
+
+    suspend fun setTransitionSpeed(speed: Int) {
+        dataStore.edit { it[Keys.TRANSITION_SPEED] = speed.coerceIn(5, 100) }
+    }
+
+    suspend fun setPulseMinBrightness(minPercent: Int) {
+        dataStore.edit { it[Keys.PULSE_MIN_BRIGHTNESS] = minPercent.coerceIn(15, 85) }
     }
 
     suspend fun setSyncEnabled(enabled: Boolean) {
@@ -280,6 +361,10 @@ class PrefsStore(context: Context) {
 
     suspend fun setAutoOpenOnCarStart(enabled: Boolean) {
         dataStore.edit { it[Keys.AUTO_OPEN_ON_CAR_START] = enabled }
+    }
+
+    suspend fun setAutoEnableBluetooth(enabled: Boolean) {
+        dataStore.edit { it[Keys.AUTO_ENABLE_BLUETOOTH] = enabled }
     }
 
     suspend fun saveGithubRepo(repo: String) {

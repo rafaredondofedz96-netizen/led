@@ -41,17 +41,27 @@ class ExampleUnitTest {
 
     @Test
     fun `pure led calibration strips minor green and blue bleed on red and respects GRB order`() {
-        // Red with slight warm/pink bleed (R=250, G=35, B=30 -> <22% of maxChannel)
-        val rgb = LedProtocol.mapRgbForStrip(
-            argb = 0xFFFA231E.toInt(),
+        // Red with <11% stray bleed (R=250, G=20, B=15 -> <11% of maxChannel)
+        val rgbClean = LedProtocol.mapRgbForStrip(
+            argb = 0xFFFA140F.toInt(),
             brightnessPercent = 100,
             colorOrder = ColorOrder.GRB,
             pureLedCalibration = true,
         )
         // GRB order: first is Green (0), second is Red (>220), third is Blue (0)
-        assertEquals(0, rgb.first)
-        assertTrue(rgb.second > 220)
-        assertEquals(0, rgb.third)
+        assertEquals(0, rgbClean.first)
+        assertTrue(rgbClean.second > 220)
+        assertEquals(0, rgbClean.third)
+
+        // Soft-knee region (G=40 = 16% of 250) transitions smoothly without hard jump
+        val rgbSoftKnee = LedProtocol.mapRgbForStrip(
+            argb = 0xFFFA281E.toInt(),
+            brightnessPercent = 100,
+            colorOrder = ColorOrder.GRB,
+            pureLedCalibration = true,
+        )
+        assertTrue(rgbSoftKnee.first in 1..10)
+        assertTrue(rgbSoftKnee.second > 220)
     }
 
     @Test
@@ -83,10 +93,14 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun `auto detect selects expected controller profile`() {
+    fun `auto detect prioritizes characteristic uuid for dual LEDCAR controllers`() {
         assertEquals(
             ProtocolProfile.LEDCAR_01,
             LedProtocol.detectProfile("LEDCAR-01-0BE6", "0000ffe1-0000-1000-8000-00805f9b34fb"),
+        )
+        assertEquals(
+            ProtocolProfile.ELK_LED_LAMP,
+            LedProtocol.detectProfile("LEDCAR-01-007E", "0000fff3-0000-1000-8000-00805f9b34fb"),
         )
         assertEquals(
             ProtocolProfile.LEDCAR_01,
@@ -119,11 +133,15 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun `saved app prefs default to auto connect and auto open on car start`() {
+    fun `saved app prefs v1_5_0 defaults include auto bluetooth and primary pulse style`() {
         val defaults = com.example.data.SavedAppPrefs()
         assertTrue(defaults.autoConnectBle)
         assertTrue(defaults.autoOpenOnCarStart)
+        assertTrue(defaults.autoEnableBluetooth)
         assertFalse(defaults.manualEffectActive)
+        assertEquals(com.example.data.CoverSyncStyle.PRIMARY_BREATHING, defaults.coverSyncStyle)
+        assertEquals(45, defaults.transitionSpeed)
+        assertEquals(35, defaults.pulseMinBrightness)
     }
 
     @Test
@@ -132,8 +150,8 @@ class ExampleUnitTest {
             "rafa/SymphonySync",
             GitHubUpdateChecker.normalizeRepoInput("https://github.com/rafa/SymphonySync.git"),
         )
-        assertTrue(GitHubUpdateChecker.isNewerVersion("1.4.0", "1.3.0"))
-        assertFalse(GitHubUpdateChecker.isNewerVersion("1.3.0", "1.3.0"))
-        assertFalse(GitHubUpdateChecker.isNewerVersion("1.2.0", "1.3.0"))
+        assertTrue(GitHubUpdateChecker.isNewerVersion("1.5.0", "1.4.0"))
+        assertFalse(GitHubUpdateChecker.isNewerVersion("1.5.0", "1.5.0"))
+        assertFalse(GitHubUpdateChecker.isNewerVersion("1.3.0", "1.4.0"))
     }
 }
