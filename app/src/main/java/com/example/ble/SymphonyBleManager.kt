@@ -117,9 +117,9 @@ class SymphonyBleManager(private val context: Context) {
         var detectedProfile: ProtocolProfile = ProtocolProfile.LEDCAR_01,
         var activeCharUuid: String? = null,
         var lastTxHex: String? = null,
-        var lastColorPacket: ByteArray? = null,
-        val controlChannel: Channel<ByteArray> = Channel(capacity = 12),
-        val colorChannel: Channel<ByteArray> = Channel(capacity = Channel.CONFLATED),
+        var lastColorPackets: List<ByteArray>? = null,
+        val controlChannel: Channel<ByteArray> = Channel(capacity = 16),
+        val colorChannel: Channel<List<ByteArray>> = Channel(capacity = Channel.CONFLATED),
         var writerJob: Job? = null,
         var connectTimeoutJob: Job? = null,
     )
@@ -247,7 +247,7 @@ class SymphonyBleManager(private val context: Context) {
         deviceProfileOverrides.putAll(profiles)
         deviceColorOrderOverrides.clear()
         deviceColorOrderOverrides.putAll(colorOrders)
-        nodes.values.forEach { it.lastColorPacket = null }
+        nodes.values.forEach { it.lastColorPackets = null }
     }
 
     fun effectiveProfileForAddress(address: String, detected: ProtocolProfile): ProtocolProfile {
@@ -437,7 +437,7 @@ class SymphonyBleManager(private val context: Context) {
         node.writerJob?.cancel()
         node.writerJob = null
         node.writeChar = null
-        node.lastColorPacket = null
+        node.lastColorPackets = null
         val oldGatt = node.gatt
         node.gatt = null
         if (oldGatt != null && hasBleConnectPermission()) {
@@ -446,6 +446,27 @@ class SymphonyBleManager(private val context: Context) {
                 oldGatt.close()
             }
         }
+    }
+
+    /**
+     * Quick BLE advertisement warmup scan for TS10 car head units waking from sleep:
+     * populates the Unisoc/Realtek BLE stack address cache so connectGatt succeeds reliably.
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun warmupScanBeforeReconnect(durationMs: Long = 2000L) {
+        val bt = adapter ?: return
+        if (!bt.isEnabled || !hasBleScanPermission() || _state.value.isScanning) return
+        val scanner = bt.bluetoothLeScanner ?: return
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        val started = runCatching {
+            scanner.startScan(null, settings, scanCallback)
+            true
+        }.getOrDefault(false)
+        if (!started) return
+        delay(durationMs)
+        runCatching { scanner.stopScan(scanCallback) }
     }
 
     /**
@@ -552,14 +573,17 @@ class SymphonyBleManager(private val context: Context) {
                 val ctrl = node.controlChannel.tryReceive().getOrNull()
                 if (ctrl != null) {
                     writeBytesToNode(node, ctrl)
-                    // Safe 95ms pacing so cheap LEDCAR-01 microcontrollers never buffer-overflow or reboot
-                    delay(95L)
+                    // Safe 85ms pacing so cheap LEDCAR-01 microcontrollers never buffer-overflow or reboot
+                    delay(85L)
                     continue
                 }
-                val color = node.colorChannel.tryReceive().getOrNull()
-                if (color != null) {
-                    writeBytesToNode(node, color)
-                    delay(95L)
+                val colorBatch = node.colorChannel.tryReceive().getOrNull()
+                if (colorBatch != null) {
+                    for (pkt in colorBatch) {
+                        if (!isActive || node.status != BleConnectionStatus.CONNECTED) break
+                        writeBytesToNode(node, pkt)
+                        delay(78L)
+                    }
                     continue
                 }
                 delay(24L)
@@ -571,7 +595,7 @@ class SymphonyBleManager(private val context: Context) {
         nodes.values.forEach { node ->
             if (node.status == BleConnectionStatus.CONNECTED) {
                 val profile = effectiveProfileFor(node)
-                node.lastColorPacket = null
+                node.lastColorPackets = null
                 LedProtocol.buildPowerPackets(profile, on).forEach { pkt ->
                     node.controlChannel.trySend(pkt)
                 }
@@ -579,11 +603,10 @@ class SymphonyBleManager(private val context: Context) {
         }
     }
 
-    fun sendControlPacketsAll(buildForProfile: (ProtocolProfile) -> ByteArray?) {
+    fun sendControlPacketsAll(buildForProfile: (ProtocolProfile) -> List<ByteArray>) {
         nodes.values.forEach { node ->
             if (node.status == BleConnectionStatus.CONNECTED) {
-                val pkt = buildForProfile(effectiveProfileFor(node))
-                if (pkt != null) {
+                buildForProfile(effectiveProfileFor(node)).forEach { pkt ->
                     node.controlChannel.trySend(pkt)
                 }
             }
@@ -619,23 +642,37 @@ class SymphonyBleManager(private val context: Context) {
             .sortedBy { it.address }
 
         connectedNodes.forEachIndexed { idx, node ->
-            val zoneArgb = if (dualZoneSplit && connectedNodes.size > 1 && idx % 2 == 1) {
+            val stripArgb = if (dualZoneSplit && connectedNodes.size > 1 && idx % 2 == 1) {
                 secondaryArgb
             } else {
                 primaryArgb
             }
-            val packet = LedProtocol.buildColorPacket(
+            val footwellArgb = if (dualZoneSplit) {
+                secondaryArgb
+            } else {
+                stripArgb
+            }
+            val packets = LedProtocol.buildColorPackets(
                 profile = effectiveProfileFor(node),
-                argb = zoneArgb,
+                stripArgb = stripArgb,
+                footwellArgb = footwellArgb,
                 brightnessPercent = brightnessPercent,
                 colorOrder = effectiveColorOrderFor(node, defaultColorOrder),
                 pureLedCalibration = pureLedCalibration,
             )
-            val prev = node.lastColorPacket
-            if (prev != null && prev.contentEquals(packet)) return@forEachIndexed
-            node.lastColorPacket = packet
-            node.colorChannel.trySend(packet)
+            val prev = node.lastColorPackets
+            if (prev != null && packetListsEqual(prev, packets)) return@forEachIndexed
+            node.lastColorPackets = packets
+            node.colorChannel.trySend(packets)
         }
+    }
+
+    private fun packetListsEqual(a: List<ByteArray>, b: List<ByteArray>): Boolean {
+        if (a.size != b.size) return false
+        for (i in a.indices) {
+            if (!a[i].contentEquals(b[i])) return false
+        }
+        return true
     }
 
     fun sendTestFlashToDevice(
@@ -647,18 +684,17 @@ class SymphonyBleManager(private val context: Context) {
         if (node.status != BleConnectionStatus.CONNECTED) return
         val profile = effectiveProfileFor(node)
         val order = effectiveColorOrderFor(node, defaultColorOrder)
-        node.lastColorPacket = null
+        node.lastColorPackets = null
         LedProtocol.buildPowerPackets(profile, true).forEach { node.controlChannel.trySend(it) }
-        LedProtocol.buildBrightnessPacket(profile, 100)?.let { node.controlChannel.trySend(it) }
-        node.controlChannel.trySend(
-            LedProtocol.buildColorPacket(
-                profile = profile,
-                argb = 0xFF00E5FF.toInt(),
-                brightnessPercent = 100,
-                colorOrder = order,
-                pureLedCalibration = pureLedCalibration,
-            )
-        )
+        LedProtocol.buildBrightnessPackets(profile, 100).forEach { node.controlChannel.trySend(it) }
+        LedProtocol.buildColorPackets(
+            profile = profile,
+            stripArgb = 0xFF00E5FF.toInt(),
+            footwellArgb = 0xFF00E5FF.toInt(),
+            brightnessPercent = 100,
+            colorOrder = order,
+            pureLedCalibration = pureLedCalibration,
+        ).forEach { node.controlChannel.trySend(it) }
     }
 
     @SuppressLint("MissingPermission")

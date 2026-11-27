@@ -7,9 +7,9 @@ import android.content.Intent
 import com.example.SymphonyApp
 
 /**
- * Handles TS10 car head-unit cold boots, quickboot wakes, package updates,
- * screen unlock, and Bluetooth adapter power-on so SymphonySync opens,
- * reconnects to both LEDCAR-01 controllers, and restores the last saved state.
+ * Handles TS10 car head-unit cold boots, quickboot wakes, ACC-ON signals,
+ * power connected, screen unlock, and Bluetooth adapter power-on so SymphonySync
+ * opens, activates Bluetooth, reconnects LED controllers, and restores state.
  */
 class BootAndCarStartReceiver : BroadcastReceiver() {
 
@@ -20,9 +20,15 @@ class BootAndCarStartReceiver : BroadcastReceiver() {
 
         when (action) {
             Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_LOCKED_BOOT_COMPLETED,
             "android.intent.action.QUICKBOOT_POWERON",
             "com.htc.intent.action.QUICKBOOT_POWERON",
-            Intent.ACTION_MY_PACKAGE_REPLACED -> {
+            Intent.ACTION_MY_PACKAGE_REPLACED,
+            Intent.ACTION_POWER_CONNECTED,
+            "com.ts.main.action.ACC_ON",
+            "android.intent.action.ACC_ON",
+            "com.fyt.boot.ACCON",
+            "com.qf.action.ACC_ON" -> {
                 val pending = goAsync()
                 engine.onCarStartedEvent(
                     triggerOpenUi = true,

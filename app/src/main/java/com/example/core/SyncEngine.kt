@@ -156,41 +156,17 @@ class SyncEngine(
         bleManager.sendPowerAll(saved.powerOn)
         if (!saved.powerOn) return
 
-        delay(110L)
+        delay(120L)
         bleManager.sendControlPacketsAll { profile ->
-            LedProtocol.buildBrightnessPacket(profile, saved.brightness)
+            LedProtocol.buildBrightnessPackets(profile, saved.brightness)
         }
-        delay(95L)
+        delay(110L)
 
-        when {
-            saved.syncEnabled -> {
-                val targetColor = if (_playback.value.track != null) {
-                    _playback.value.liveLedArgb
-                } else {
-                    saved.lastLiveLedArgb
-                }
-                sendColorWithPrefs(targetColor, saved)
-            }
-
-            saved.manualEffectActive -> {
-                val effect = LedProtocol.symphonyEffects.getOrNull(saved.activeEffectIndex)
-                bleManager.sendControlPacketsAll { profile ->
-                    LedProtocol.buildSpeedPacket(profile, saved.effectSpeed)
-                }
-                delay(95L)
-                if (effect != null) {
-                    bleManager.sendControlPacketsAll { profile ->
-                        LedProtocol.buildEffectPacket(profile, effect, saved.effectSpeed)
-                    }
-                } else {
-                    sendColorWithPrefs(saved.manualColorArgb, saved)
-                }
-            }
-
-            else -> {
-                sendColorWithPrefs(saved.manualColorArgb, saved)
-            }
+        val targetColor = when {
+            saved.syncEnabled -> if (_playback.value.track != null) _playback.value.liveLedArgb else saved.lastLiveLedArgb
+            else -> saved.manualColorArgb
         }
+        sendColorWithPrefs(targetColor, saved)
     }
 
     private fun connectAllSavedDevicesStaggered(saved: SavedAppPrefs = _prefs.value) {
@@ -198,16 +174,23 @@ class SyncEngine(
             bleManager.refreshAdapterState()
             if (!bleState.value.isBluetoothEnabled && saved.autoEnableBluetooth) {
                 bleManager.tryAutoEnableBluetooth()
-                delay(900L)
+                delay(1200L)
                 bleManager.refreshAdapterState()
             }
-            if (!bleState.value.isBluetoothEnabled || !bleManager.hasBleConnectPermission()) return@launch
-            val devices = saved.savedBleDevices
+            if (!bleState.value.isBluetoothEnabled || !bleManager.hasBleConnectPermission()) {
+                scheduleAutoReconnectIfNeeded(aggressiveCarStart = true)
+                return@launch
+            }
+            val devices = saved.savedBleDevices.filter { !bleManager.isManuallyDisconnected(it.address) }
+            if (devices.isEmpty()) return@launch
+
+            bleManager.warmupScanBeforeReconnect(1800L)
             devices.forEach { dev ->
                 if (!bleManager.isManuallyDisconnected(dev.address)) {
                     bleManager.connectSequential(dev.address, dev.name)
                 }
             }
+            scheduleAutoReconnectIfNeeded(aggressiveCarStart = true)
         }
     }
 
@@ -227,9 +210,9 @@ class SyncEngine(
         }
         reconnectJob = scope.launch {
             val steps = if (aggressiveCarStart) {
-                listOf(1500L, 2500L, 3500L, 5000L, 7000L, 10_000L)
+                listOf(1500L, 2500L, 3500L, 5000L, 7000L, 10_000L, 12_000L)
             } else {
-                listOf(4000L, 6000L, 9000L, 12_000L)
+                listOf(3500L, 5000L, 8000L, 12_000L)
             }
             var stepIdx = 0
             while (isActive) {
@@ -254,6 +237,7 @@ class SyncEngine(
                 }
                 if (pending.isEmpty()) break
 
+                bleManager.warmupScanBeforeReconnect(1800L)
                 pending.forEach { dev ->
                     bleManager.connectSequential(dev.address, dev.name)
                 }
@@ -355,8 +339,8 @@ class SyncEngine(
     }
 
     /**
-     * Unified smooth transition + progressive intensity engine (~8.7 Hz, 115ms pacing).
-     * Eliminates abrupt color jumps and flashes on song changes or breathing transitions.
+     * Unified smooth transition + progressive intensity engine (~6.5 Hz, 155ms pacing
+     * matched cleanly to dual 7B+7E BLE packet writes).
      */
     private fun startCoverAnimationLoop() {
         animationJob?.cancel()
@@ -364,6 +348,7 @@ class SyncEngine(
             var phase = 0f
             var smoothedPrimary = _playback.value.liveLedArgb
             var smoothedSecondary = _playback.value.palette.secondaryArgb
+            var smoothedAccent = _playback.value.palette.accentArgb
             var lastSentPrimary = 0
             var lastSentSecondary = 0
             var lastSentBrightness = -1f
@@ -378,14 +363,17 @@ class SyncEngine(
                 val pal = _playback.value.palette
                 val hasTrack = _playback.value.track != null
                 val targetPrimary = if (hasTrack) pal.primaryArgb else saved.lastLiveLedArgb
-                val targetSecondary = if (hasTrack) pal.secondaryArgb else pal.secondaryArgb
+                val targetSecondary = pal.secondaryArgb
+                val targetAccent = pal.accentArgb
 
                 // Progressive easing factor controlled by saved.transitionSpeed (5..100)
-                val easeFraction = 0.055f + (saved.transitionSpeed / 100f) * 0.24f
+                val easeFraction = 0.06f + (saved.transitionSpeed / 100f) * 0.22f
                 smoothedPrimary = easeRgbSmooth(smoothedPrimary, targetPrimary, easeFraction)
                 smoothedSecondary = easeRgbSmooth(smoothedSecondary, targetSecondary, easeFraction)
+                smoothedAccent = easeRgbSmooth(smoothedAccent, targetAccent, easeFraction)
 
                 val waveT = ((1.0 - cos(phase * 2.0 * PI)) * 0.5).toFloat()
+                val waveShifted = ((1.0 - cos(((phase + 0.35f) % 1f) * 2.0 * PI)) * 0.5).toFloat()
                 val minFloor = (saved.pulseMinBrightness / 100f).coerceIn(0.15f, 0.85f)
                 val maxBrightness = saved.brightness.toFloat()
                 val isPlaying = _playback.value.track?.isPlaying != false
@@ -408,14 +396,21 @@ class SyncEngine(
                     }
 
                     CoverSyncStyle.DUAL_BREATHING -> {
-                        val blend = if (smoothedPrimary == smoothedSecondary) {
-                            smoothedPrimary
-                        } else {
-                            AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedSecondary, waveT)
+                        outPrimary = AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedSecondary, waveT)
+                        val softFloor = minFloor.coerceAtLeast(0.62f)
+                        outBrightness = maxBrightness * (softFloor + (1f - softFloor) * waveT)
+                    }
+
+                    CoverSyncStyle.TRI_PALETTE_FLOW -> {
+                        val seg = (phase * 3f) % 3f
+                        val idx = seg.toInt()
+                        val localFrac = ((1.0 - cos((seg - idx) * PI)) * 0.5).toFloat()
+                        outPrimary = when (idx) {
+                            0 -> AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedSecondary, localFrac)
+                            1 -> AlbumPaletteExtractor.lerpRgb(smoothedSecondary, smoothedAccent, localFrac)
+                            else -> AlbumPaletteExtractor.lerpRgb(smoothedAccent, smoothedPrimary, localFrac)
                         }
-                        outPrimary = blend
-                        // Subtle gentle intensity lift without dipping dark
-                        val softFloor = minFloor.coerceAtLeast(0.65f)
+                        val softFloor = minFloor.coerceAtLeast(0.68f)
                         outBrightness = maxBrightness * (softFloor + (1f - softFloor) * waveT)
                     }
 
@@ -427,11 +422,36 @@ class SyncEngine(
                         outBrightness = maxBrightness * (minFloor + (1f - minFloor) * depth)
                     }
 
+                    CoverSyncStyle.HEARTBEAT_GLOW -> {
+                        // Organic double-swell pulse (no harsh spikes or snaps)
+                        val mainPulse = ((1.0 - cos(phase * 2.0 * PI)) * 0.5).toFloat()
+                        val secondSwell = ((1.0 - cos(((phase * 2f) % 1f) * 2.0 * PI)) * 0.5).toFloat()
+                        val envelope = (mainPulse * 0.65f + secondSwell * 0.35f).coerceIn(0f, 1f)
+                        outPrimary = AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedAccent, envelope * 0.25f)
+                        val depth = if (isPlaying) envelope else 0.7f
+                        outBrightness = maxBrightness * (minFloor + (1f - minFloor) * depth)
+                    }
+
+                    CoverSyncStyle.AURORA_MIX -> {
+                        dualSplit = true
+                        outPrimary = AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedAccent, waveT)
+                        outSecondary = AlbumPaletteExtractor.lerpRgb(smoothedSecondary, smoothedPrimary, waveShifted)
+                        val softFloor = minFloor.coerceAtLeast(0.60f)
+                        outBrightness = maxBrightness * (softFloor + (1f - softFloor) * waveT)
+                    }
+
                     CoverSyncStyle.SPECTRUM_DRIFT -> {
-                        val driftDeg = ((waveT - 0.5f) * 34f)
+                        val driftDeg = (waveT - 0.5f) * 32f
                         outPrimary = shiftHueGentle(smoothedPrimary, driftDeg)
                         val depth = if (isPlaying) waveT else 0.8f
                         outBrightness = maxBrightness * (minFloor + (1f - minFloor) * depth)
+                    }
+
+                    CoverSyncStyle.NIGHT_CRUISE -> {
+                        outPrimary = AlbumPaletteExtractor.lerpRgb(smoothedPrimary, smoothedSecondary, waveT * 0.45f)
+                        val nightCap = maxBrightness.coerceAtMost(60f)
+                        val depth = 0.55f + 0.45f * waveT
+                        outBrightness = (nightCap * depth).coerceAtLeast(10f)
                     }
                 }
 
@@ -459,10 +479,10 @@ class SyncEngine(
                     )
                 }
 
-                // Gentle progressive breathing rate
-                val phaseStep = 0.008f + (saved.transitionSpeed / 100f) * 0.026f
+                val speedFactor = if (saved.coverSyncStyle == CoverSyncStyle.NIGHT_CRUISE) 0.5f else 1f
+                val phaseStep = (0.010f + (saved.transitionSpeed / 100f) * 0.030f) * speedFactor
                 phase = (phase + phaseStep) % 1f
-                delay(115L)
+                delay(155L)
             }
         }
     }
@@ -522,7 +542,7 @@ class SyncEngine(
 
             BluetoothAdapter.STATE_ON -> {
                 bleManager.handleBluetoothAdapterStateChanged(true)
-                val wokeFromSleep = wasBluetoothOff
+                val wokeFromSleep = wasBluetoothOff || !isActivityVisible
                 wasBluetoothOff = false
                 onCarStartedEvent(
                     triggerOpenUi = wokeFromSleep,
@@ -534,12 +554,13 @@ class SyncEngine(
 
     fun onScreenOrUserWake(isUserPresent: Boolean, onComplete: (() -> Unit)? = null) {
         val sleptLongEnough = lastScreenOffElapsedMs > 0L &&
-            (SystemClock.elapsedRealtime() - lastScreenOffElapsedMs) >= 20_000L
+            (SystemClock.elapsedRealtime() - lastScreenOffElapsedMs) >= 15_000L
         if (sleptLongEnough) {
             lastScreenOffElapsedMs = 0L
         }
+        val shouldOpen = !isActivityVisible && (sleptLongEnough || isUserPresent || !bleState.value.isConnected)
         onCarStartedEvent(
-            triggerOpenUi = sleptLongEnough || (isUserPresent && !bleState.value.isConnected && sleptLongEnough),
+            triggerOpenUi = shouldOpen,
             reason = if (isUserPresent) "user_present" else "screen_on",
             onComplete = onComplete,
         )
@@ -682,23 +703,13 @@ class SyncEngine(
         scope.launch {
             prefsStore.setBrightness(clamped)
             bleManager.sendControlPacketsAll { profile ->
-                LedProtocol.buildBrightnessPacket(profile, clamped)
+                LedProtocol.buildBrightnessPackets(profile, clamped)
             }
             if (_prefs.value.powerOn) {
-                delay(100L)
+                delay(110L)
                 val saved = _prefs.value
                 val color = if (saved.syncEnabled) _playback.value.liveLedArgb else saved.manualColorArgb
                 sendColorWithPrefs(color, saved.copy(brightness = clamped))
-            }
-        }
-    }
-
-    fun setEffectSpeed(percent: Int) {
-        val clamped = percent.coerceIn(5, 100)
-        scope.launch {
-            prefsStore.setEffectSpeed(clamped)
-            bleManager.sendControlPacketsAll { profile ->
-                LedProtocol.buildSpeedPacket(profile, clamped)
             }
         }
     }
@@ -733,34 +744,10 @@ class SyncEngine(
             if (!_prefs.value.powerOn) {
                 prefsStore.setPowerOn(true)
                 bleManager.sendPowerAll(true)
-                delay(160L)
+                delay(180L)
             }
             _playback.update { it.copy(liveLedArgb = argb) }
             sendColorWithPrefs(argb, _prefs.value)
-        }
-    }
-
-    fun selectSymphonyEffect(effectIndex: Int) {
-        val effect = LedProtocol.symphonyEffects.getOrNull(effectIndex) ?: return
-        scope.launch {
-            prefsStore.setActiveEffectIndex(effectIndex)
-            prefsStore.setManualEffectActive(true)
-            if (_prefs.value.syncEnabled) {
-                prefsStore.setSyncEnabled(false)
-            }
-            if (!_prefs.value.powerOn) {
-                prefsStore.setPowerOn(true)
-                bleManager.sendPowerAll(true)
-                delay(160L)
-            }
-            val speed = _prefs.value.effectSpeed
-            bleManager.sendControlPacketsAll { profile ->
-                LedProtocol.buildSpeedPacket(profile, speed)
-            }
-            delay(95L)
-            bleManager.sendControlPacketsAll { profile ->
-                LedProtocol.buildEffectPacket(profile, effect, speed)
-            }
         }
     }
 

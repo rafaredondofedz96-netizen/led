@@ -316,13 +316,15 @@ private fun HeroSpotifyStage(
                 }
             }
 
-            // Extracted 2 Predominant Colors Strip
+            // Extracted 3 Predominant Colors Strip
+            val accentColor = Color(palette.accentArgb)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                PaletteChip("Color Principal", primaryColor, Modifier.weight(1f))
+                PaletteChip("Principal", primaryColor, Modifier.weight(1f))
                 PaletteChip("Secundario", secondaryColor, Modifier.weight(1f))
+                PaletteChip("Acento", accentColor, Modifier.weight(1f))
             }
 
             // Helpful Action Shortcuts when not yet configured

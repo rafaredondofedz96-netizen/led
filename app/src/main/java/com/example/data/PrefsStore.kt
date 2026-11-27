@@ -36,15 +36,35 @@ enum class CoverSyncStyle(val id: String, val label: String, val description: St
         "Onda 2 Colores",
         "Fluye progresivamente entre el color principal y secundario",
     ),
+    TRI_PALETTE_FLOW(
+        "tri_flow",
+        "Flujo 3 Colores",
+        "Recorre suavemente los 3 colores predominantes de la portada",
+    ),
     DUAL_ZONES(
         "zones",
         "Tiras / Pies Dual",
-        "Color principal en un controlador y secundario en el otro",
+        "Color principal en tiras y secundario en reposapiés / segundo controlador",
+    ),
+    HEARTBEAT_GLOW(
+        "heartbeat",
+        "Latido Suave",
+        "Doble pulso progresivo elegante sin flashes sobre el tono principal",
+    ),
+    AURORA_MIX(
+        "aurora",
+        "Aurora Portada",
+        "Cruza suavemente tiras y reposapiés entre principal, secundario y acento",
     ),
     SPECTRUM_DRIFT(
         "drift",
         "Brisa Neón",
         "Respira suavemente con matiz armónico sin cambios bruscos",
+    ),
+    NIGHT_CRUISE(
+        "night",
+        "Conducción Nocturna",
+        "Brillo suavizado anti-reflejos con transición lenta para conducir de noche",
     );
 
     companion object {

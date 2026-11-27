@@ -19,7 +19,6 @@ import kotlinx.coroutines.flow.stateIn
 
 enum class AppTab(val label: String) {
     LIVE("En Vivo"),
-    MODES("Lamp LED"),
     BLUETOOTH("Bluetooth"),
     ACCOUNT("Spotify"),
 }
@@ -77,13 +76,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun togglePower(on: Boolean) = engine.togglePower(on)
     fun setBrightness(percent: Int) = engine.setBrightness(percent)
-    fun setEffectSpeed(percent: Int) = engine.setEffectSpeed(percent)
     fun setTransitionSpeed(speed: Int) = engine.setTransitionSpeed(speed)
     fun setPulseMinBrightness(minPercent: Int) = engine.setPulseMinBrightness(minPercent)
     fun setSyncEnabled(enabled: Boolean) = engine.setSyncEnabled(enabled)
     fun setCoverSyncStyle(style: CoverSyncStyle) = engine.setCoverSyncStyle(style)
     fun setManualColor(argb: Int) = engine.setManualColor(argb)
-    fun selectSymphonyEffect(index: Int) = engine.selectSymphonyEffect(index)
     fun setPollIntervalMs(intervalMs: Long) = engine.setPollIntervalMs(intervalMs)
 
     fun buildSpotifyAuthUrl(clientId: String, clientSecret: String): String? =

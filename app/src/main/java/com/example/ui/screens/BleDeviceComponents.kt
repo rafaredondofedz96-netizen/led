@@ -224,12 +224,97 @@ internal fun ActiveControllerItemCard(
 
 internal fun ProtocolProfile.shortChipLabel(): String = when (this) {
     ProtocolProfile.AUTO -> "Auto"
-    ProtocolProfile.LEDCAR_01 -> "LEDCAR 7B 07"
+    ProtocolProfile.LEDCAR_01 -> "LEDCAR Dual 7B+7E"
+    ProtocolProfile.LEDCAR_01_ONLY_7B -> "Solo Tiras 7B"
     ProtocolProfile.LEDCAR_01_ALT -> "LEDCAR Alt 04"
-    ProtocolProfile.ELK_LED_LAMP -> "ELK 7E..EF"
+    ProtocolProfile.ELK_LED_LAMP -> "ELK / Pies 7E"
     ProtocolProfile.BJ_LED -> "BJ 69 96"
     ProtocolProfile.TRIONES -> "Triones"
     ProtocolProfile.SP110E -> "SP110E"
+}
+
+@Composable
+internal fun Ts10AutoStartPermissionsCard(
+    hasOverlayPermission: Boolean,
+    isIgnoringBatteryOpt: Boolean,
+    onRequestOverlayPermission: () -> Unit,
+    onRequestBatteryExemption: () -> Unit,
+) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = CockpitSurface,
+        border = BorderStroke(
+            1.dp,
+            if (hasOverlayPermission && isIgnoringBatteryOpt) SpotifyGreen.copy(alpha = 0.55f)
+            else AmberWarn.copy(alpha = 0.65f),
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Permisos Radio TS10 (Auto-Inicio)", style = MaterialTheme.typography.titleLarge)
+            Text(
+                text = "En Android de coche, estos 2 permisos permiten abrir la app al dar contacto y evitar que el sistema desconecte el Bluetooth en reposo.",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary,
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Mostrar sobre otras apps", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        text = if (hasOverlayPermission) "Concedido (puede abrirse sola)"
+                        else "Requerido para abrirse al encender",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (hasOverlayPermission) SpotifyGreen else AmberWarn,
+                    )
+                }
+                if (!hasOverlayPermission) {
+                    OutlinedButton(
+                        onClick = onRequestOverlayPermission,
+                        border = BorderStroke(1.dp, AmberWarn),
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("grant_overlay_button"),
+                    ) {
+                        Text("Permitir", color = AmberWarn)
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Sin ahorro de batería", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        text = if (isIgnoringBatteryOpt) "Activo (BLE estable en segundo plano)"
+                        else "Evita que la radio cierre la app al dormir",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isIgnoringBatteryOpt) SpotifyGreen else AmberWarn,
+                    )
+                }
+                if (!isIgnoringBatteryOpt) {
+                    OutlinedButton(
+                        onClick = onRequestBatteryExemption,
+                        border = BorderStroke(1.dp, AmberWarn),
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("grant_battery_button"),
+                    ) {
+                        Text("Permitir", color = AmberWarn)
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable

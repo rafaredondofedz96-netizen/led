@@ -2,10 +2,14 @@ package com.example
 
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -29,11 +33,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.Bluetooth
 import androidx.compose.material.icons.outlined.GraphicEq
-import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.GraphicEq
-import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -45,9 +47,13 @@ import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -56,17 +62,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.ui.AppTab
 import com.example.ui.MainUiState
 import com.example.ui.MainViewModel
 import com.example.ui.screens.BluetoothScreen
-import com.example.ui.screens.LedLampControlScreen
 import com.example.ui.screens.LiveCockpitScreen
 import com.example.ui.screens.SpotifyAccountScreen
 import com.example.ui.theme.CockpitSurface
 import com.example.ui.theme.CockpitVoid
-import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.SymphonySyncTheme
 import com.example.ui.theme.TextSecondary
 
@@ -139,6 +146,54 @@ private fun SymphonyCockpitShell(
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(AppTab.LIVE) }
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val latestState by rememberUpdatedState(state)
+
+    var resumeTick by remember { mutableIntStateOf(0) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                resumeTick++
+                viewModel.refreshBluetoothState()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val hasOverlayPermission = remember(resumeTick) {
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
+    }
+    val isIgnoringBatteryOpt = remember(resumeTick) {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+    }
+
+    val requestOverlayPermission = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:${context.packageName}"),
+            )
+            runCatching { context.startActivity(intent) }
+        }
+    }
+
+    val requestBatteryExemption = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val direct = Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:${context.packageName}"),
+            )
+            val launched = runCatching { context.startActivity(direct); true }.getOrDefault(false)
+            if (!launched) {
+                runCatching {
+                    context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                }
+            }
+        }
+    }
 
     // Navigate back from secondary tabs to Live Cockpit first
     BackHandler(enabled = selectedTab != AppTab.LIVE) {
@@ -150,14 +205,12 @@ private fun SymphonyCockpitShell(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { _ ->
         viewModel.refreshBluetoothState()
-        if (state.ble.isBluetoothEnabled) {
-            (context.applicationContext as? SymphonyApp)?.syncEngine?.reconnectSavedDevicesIfNeeded()
-        }
+        (context.applicationContext as? SymphonyApp)?.syncEngine?.reconnectSavedDevicesIfNeeded()
     }
 
     val ensureBluetoothOn = {
         viewModel.refreshBluetoothState()
-        if (!state.ble.isBluetoothEnabled) {
+        if (!latestState.ble.isBluetoothEnabled) {
             val silentlyRequested = viewModel.tryAutoEnableBluetooth()
             if (!silentlyRequested && viewModel.hasBleConnectPermission()) {
                 runCatching {
@@ -167,13 +220,20 @@ private fun SymphonyCockpitShell(
         }
     }
 
+    var startScanAfterPerm by remember { mutableStateOf(false) }
     val blePermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        if (results.values.all { it }) {
+        val allGranted = results.values.all { it }
+        if (allGranted) {
             ensureBluetoothOn()
-            viewModel.startBleScan()
+            if (startScanAfterPerm) {
+                viewModel.startBleScan()
+            } else {
+                (context.applicationContext as? SymphonyApp)?.syncEngine?.reconnectSavedDevicesIfNeeded()
+            }
         }
+        startScanAfterPerm = false
     }
 
     val notificationLauncher = rememberLauncherForActivityResult(
@@ -181,10 +241,6 @@ private fun SymphonyCockpitShell(
     ) { _ -> }
 
     LaunchedEffect(Unit) {
-        viewModel.refreshBluetoothState()
-        if (state.prefs.autoEnableBluetooth && !state.ble.isBluetoothEnabled) {
-            ensureBluetoothOn()
-        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
                 context,
@@ -194,6 +250,24 @@ private fun SymphonyCockpitShell(
                 notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
+        if (!viewModel.hasBleConnectPermission() || !viewModel.hasBleScanPermission()) {
+            startScanAfterPerm = false
+            blePermissionLauncher.launch(blePermissions)
+        }
+    }
+
+    var autoEnablePromptedOnce by remember { mutableStateOf(false) }
+    LaunchedEffect(state.prefs.autoEnableBluetooth, state.ble.isBluetoothEnabled, resumeTick) {
+        viewModel.refreshBluetoothState()
+        if (state.prefs.autoEnableBluetooth && !state.ble.isBluetoothEnabled) {
+            val silentOk = viewModel.tryAutoEnableBluetooth()
+            if (!silentOk && !autoEnablePromptedOnce && viewModel.hasBleConnectPermission()) {
+                autoEnablePromptedOnce = true
+                runCatching {
+                    enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                }
+            }
+        }
     }
 
     val requestBleScanWithPermissions = {
@@ -201,6 +275,7 @@ private fun SymphonyCockpitShell(
             ensureBluetoothOn()
             viewModel.startBleScan()
         } else {
+            startScanAfterPerm = true
             blePermissionLauncher.launch(blePermissions)
         }
     }
@@ -210,6 +285,7 @@ private fun SymphonyCockpitShell(
             ensureBluetoothOn()
             viewModel.connectBleDevice(addr, name)
         } else {
+            startScanAfterPerm = false
             blePermissionLauncher.launch(blePermissions)
         }
     }
@@ -258,10 +334,14 @@ private fun SymphonyCockpitShell(
                         state = state,
                         isWidescreen = true,
                         viewModel = viewModel,
+                        hasOverlayPermission = hasOverlayPermission,
+                        isIgnoringBatteryOpt = isIgnoringBatteryOpt,
                         onNavigateTab = { selectedTab = it },
                         onRequestScan = requestBleScanWithPermissions,
                         onConnectDevice = connectBleWithPermissions,
                         onEnableBluetoothNow = ensureBluetoothOn,
+                        onRequestOverlayPermission = requestOverlayPermission,
+                        onRequestBatteryExemption = requestBatteryExemption,
                     )
                 }
             }
@@ -304,10 +384,14 @@ private fun SymphonyCockpitShell(
                         state = state,
                         isWidescreen = false,
                         viewModel = viewModel,
+                        hasOverlayPermission = hasOverlayPermission,
+                        isIgnoringBatteryOpt = isIgnoringBatteryOpt,
                         onNavigateTab = { selectedTab = it },
                         onRequestScan = requestBleScanWithPermissions,
                         onConnectDevice = connectBleWithPermissions,
                         onEnableBluetoothNow = ensureBluetoothOn,
+                        onRequestOverlayPermission = requestOverlayPermission,
+                        onRequestBatteryExemption = requestBatteryExemption,
                     )
                 }
             }
@@ -321,10 +405,14 @@ private fun ActiveTabContent(
     state: MainUiState,
     isWidescreen: Boolean,
     viewModel: MainViewModel,
+    hasOverlayPermission: Boolean,
+    isIgnoringBatteryOpt: Boolean,
     onNavigateTab: (AppTab) -> Unit,
     onRequestScan: () -> Unit,
     onConnectDevice: (String, String) -> Unit,
     onEnableBluetoothNow: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onRequestBatteryExemption: () -> Unit,
 ) {
     when (selectedTab) {
         AppTab.LIVE -> LiveCockpitScreen(
@@ -340,18 +428,11 @@ private fun ActiveTabContent(
             onNavigateTab = onNavigateTab,
         )
 
-        AppTab.MODES -> LedLampControlScreen(
-            state = state,
-            isWidescreen = isWidescreen,
-            onManualColor = viewModel::setManualColor,
-            onBrightnessChange = viewModel::setBrightness,
-            onSpeedChange = viewModel::setEffectSpeed,
-            onSelectEffect = viewModel::selectSymphonyEffect,
-        )
-
         AppTab.BLUETOOTH -> BluetoothScreen(
             state = state,
             isWidescreen = isWidescreen,
+            hasOverlayPermission = hasOverlayPermission,
+            isIgnoringBatteryOpt = isIgnoringBatteryOpt,
             onRequestScan = onRequestScan,
             onStopScan = viewModel::stopBleScan,
             onConnectDevice = onConnectDevice,
@@ -367,6 +448,8 @@ private fun ActiveTabContent(
             onToggleAutoOpenOnCarStart = viewModel::setAutoOpenOnCarStart,
             onToggleAutoEnableBluetooth = viewModel::setAutoEnableBluetooth,
             onEnableBluetoothNow = onEnableBluetoothNow,
+            onRequestOverlayPermission = onRequestOverlayPermission,
+            onRequestBatteryExemption = onRequestBatteryExemption,
         )
 
         AppTab.ACCOUNT -> SpotifyAccountScreen(
@@ -386,7 +469,6 @@ private fun ActiveTabContent(
 private fun TabIcon(tab: AppTab, selected: Boolean) {
     val icon = when (tab) {
         AppTab.LIVE -> if (selected) Icons.Rounded.GraphicEq else Icons.Outlined.GraphicEq
-        AppTab.MODES -> if (selected) Icons.Rounded.Palette else Icons.Outlined.Palette
         AppTab.BLUETOOTH -> if (selected) Icons.Rounded.Bluetooth else Icons.Outlined.Bluetooth
         AppTab.ACCOUNT -> if (selected) Icons.Rounded.AccountCircle else Icons.Outlined.AccountCircle
     }

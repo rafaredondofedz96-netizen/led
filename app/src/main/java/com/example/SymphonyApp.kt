@@ -45,6 +45,11 @@ class SymphonyApp : Application() {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction("com.ts.main.action.ACC_ON")
+            addAction("android.intent.action.ACC_ON")
+            addAction("com.fyt.boot.ACCON")
+            addAction("com.qf.action.ACC_ON")
         }
         runCatching {
             ContextCompat.registerReceiver(

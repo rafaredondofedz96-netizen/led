@@ -53,6 +53,8 @@ import com.example.ui.theme.TextSecondary
 fun BluetoothScreen(
     state: MainUiState,
     isWidescreen: Boolean,
+    hasOverlayPermission: Boolean,
+    isIgnoringBatteryOpt: Boolean,
     onRequestScan: () -> Unit,
     onStopScan: () -> Unit,
     onConnectDevice: (String, String) -> Unit,
@@ -68,6 +70,8 @@ fun BluetoothScreen(
     onToggleAutoOpenOnCarStart: (Boolean) -> Unit,
     onToggleAutoEnableBluetooth: (Boolean) -> Unit,
     onEnableBluetoothNow: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onRequestBatteryExemption: () -> Unit,
 ) {
     val ble = state.ble
     if (isWidescreen) {
@@ -96,6 +100,12 @@ fun BluetoothScreen(
                     onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
                     onToggleAutoEnableBluetooth = onToggleAutoEnableBluetooth,
                     onEnableBluetoothNow = onEnableBluetoothNow,
+                )
+                Ts10AutoStartPermissionsCard(
+                    hasOverlayPermission = hasOverlayPermission,
+                    isIgnoringBatteryOpt = isIgnoringBatteryOpt,
+                    onRequestOverlayPermission = onRequestOverlayPermission,
+                    onRequestBatteryExemption = onRequestBatteryExemption,
                 )
                 ColorCalibrationCard(
                     colorOrder = state.prefs.colorOrder,
@@ -141,6 +151,12 @@ fun BluetoothScreen(
                 onToggleAutoOpenOnCarStart = onToggleAutoOpenOnCarStart,
                 onToggleAutoEnableBluetooth = onToggleAutoEnableBluetooth,
                 onEnableBluetoothNow = onEnableBluetoothNow,
+            )
+            Ts10AutoStartPermissionsCard(
+                hasOverlayPermission = hasOverlayPermission,
+                isIgnoringBatteryOpt = isIgnoringBatteryOpt,
+                onRequestOverlayPermission = onRequestOverlayPermission,
+                onRequestBatteryExemption = onRequestBatteryExemption,
             )
             DiscoveredDevicesCard(
                 devices = ble.discoveredDevices,
